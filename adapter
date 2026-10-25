@@ -1,0 +1,728 @@
+-- Turbo Soccer native simulation/input binding. No synthetic car or ball state is written.
+local Adapter={};Adapter.__index=Adapter
+local names={"throttle","steer","pitch","yaw","roll","jump","boost","handbrake"}
+local function controls() return {throttle=0,steer=0,pitch=0,yaw=0,roll=0,jump=false,boost=false,handbrake=false,item=false} end
+local loadedModules=(function()
+-- Normalize array and keyed inventories without executing any module.
+return function(provider,isModule)
+    provider=provider or getloadedmodules
+    local result={list={},set={},available=false}
+    if type(provider)~="function" then return result end
+    local ok,values=pcall(provider)
+    if not ok or type(values)~="table" then return result end
+    result.available=true
+    isModule=isModule or function(value) return typeof(value)=="Instance" and value:IsA("ModuleScript") end
+    local function add(value)
+        if isModule(value) and not result.set[value] then result.set[value]=true;table.insert(result.list,value) end
+    end
+    for key,value in pairs(values) do add(key);add(value) end
+    return result
+end
+
+end)()
+local discoverClient=(function()
+-- Require only a cached ScopeRef; a staged or unknown scope is never booted.
+return function(player,inventory,requireModule)
+    requireModule=requireModule or require
+    local best,version,bestActive=nil,-1,false
+    local scopes=0
+    for _,folder in ipairs(player.PlayerScripts:GetChildren()) do
+        local n=tonumber(folder.Name:match("^Generation_(%d+)$"))
+        local client=folder:FindFirstChild("Client")
+        if client and folder:FindFirstChild("Shared") and client:FindFirstChild("Input") then
+            local context=client:FindFirstChild("__LiveContext")
+            local active,eligible=false,n~=nil
+            if context then
+                eligible=false;scopes+=1
+                local ref=context:FindFirstChild("ScopeRef")
+                if ref and inventory.set[ref] then
+                    local ok,scope=pcall(requireModule,ref)
+                    if ok and type(scope)=="table" and type(scope.status)=="function" then
+                        local good,status=pcall(scope.status,scope)
+                        active=good and type(status)=="table" and status.phase=="active"
+                        eligible=active
+                    end
+                end
+                n=tonumber(context:GetAttribute("Generation")) or n or 0
+            end
+            if eligible and (not best or active and not bestActive or active==bestActive and n>version) then
+                best=client;version=n;bestActive=active
+            end
+        end
+    end
+    return best,{loaded=#inventory.list,scopes=scopes}
+end
+
+end)()
+local function activeClient(player) return discoverClient(player,loadedModules()) end
+-- New game builds rename these modules. Resolve only already-loaded direct
+-- children by stable exported interfaces; never execute an unknown staged module.
+local function resolveModule(parent,name,matches)
+    local named=parent:FindFirstChild(name)
+    local inventory=loadedModules()
+    if named and inventory.set[named] then
+        local ok,value=pcall(require,named)
+        if ok and type(value)=="table" and matches(value) then return named,value end
+    end
+    local found,value
+    for _,module in ipairs(loadedModules().list) do
+        if module.Parent==parent then
+            local ok,exports=pcall(require,module)
+            if ok and type(exports)=="table" and matches(exports) then
+                assert(not found,"Ambiguous Turbo Soccer "..name.." module")
+                found,value=module,exports
+            end
+        end
+    end
+    assert(found,"Turbo Soccer "..name.." module is not loaded or its interface changed")
+    return found,value
+end
+-- DEADWIRE TURBO INPUT BRIDGE BEGIN
+local bindInput=(function()
+-- Keep trained controls after native touch assists; preserve the manual path.
+return function(adapter,nativeInput,phoneAssist)
+    local names={"throttle","steer","pitch","yaw","roll","jump","boost","handbrake"}
+    local original=nativeInput.read
+    local pending=setmetatable({}, {__mode="k"})
+    local stopped=false
+    local function write(target,value)
+        for _,name in ipairs(names) do target[name]=value[name] end
+        target.dodge=nil;target.item=false
+    end
+    local hook=function(target,settings,allowed,...)
+        table.clear(pending)
+        local a,b=original(target,settings,allowed,...)
+        adapter.target=target;adapter.LastInputAllowed=allowed
+        local manual=table.clone(target)
+        -- Native touch auto-throttle is a default, not a held human control.
+        -- Keep braking, steering, jump, boost and all other takeover signals.
+        local touch=nativeInput.touch
+        if allowed~=false and type(touch)=="table" and type(settings)=="table"
+            and type(settings.touch)=="table" and settings.touch.throttle=="auto"
+            and not touch.brake and type(nativeInput.device)=="function" then
+            local ok,device=pcall(nativeInput.device)
+            if ok and device=="touch" and manual.throttle==1 then manual.throttle=0 end
+        end
+        adapter.ManualControls=manual
+        if not stopped and adapter.Running and allowed~=false then
+            local value=adapter.Input.Read()
+            if type(value)=="table" and value~=manual then
+                write(target,value)
+                adapter.LastApplied=table.clone(value)
+                adapter.AppliedReads=(adapter.AppliedReads or 0)+1
+                if adapter.ControlEpoch then
+                    pending[target]={value=table.clone(value),epoch=adapter.ControlEpoch()}
+                end
+            end
+        end
+        return a,b
+    end
+    nativeInput.read=hook
+    adapter.OriginalNativeRead=original
+    local assistOriginal,assistHook
+    if type(phoneAssist)=="table" and type(phoneAssist.apply)=="function" then
+        assistOriginal=phoneAssist.apply
+        assistHook=function(target,...)
+            local entry=pending[target];pending[target]=nil
+            local a,b=assistOriginal(target,...)
+            if entry and not stopped and adapter.Running and adapter.target==target
+                and adapter.LastInputAllowed~=false
+                and adapter.ControlsCurrent and adapter.ControlsCurrent(entry.epoch) then
+                -- PhoneAssist runs after Input.read in the native client. Only
+                -- a current policy write can be restored here, never manual input.
+                local changed=target.dodge~=nil or target.item~=false
+                for _,name in ipairs(names) do if target[name]~=entry.value[name] then changed=true;break end end
+                if changed then
+                    write(target,entry.value)
+                    adapter.AssistCorrections=(adapter.AssistCorrections or 0)+1
+                end
+            end
+            return a,b
+        end
+        phoneAssist.apply=assistHook
+    end
+    adapter.PhoneAssistBound=assistHook~=nil
+    return function()
+        stopped=true;table.clear(pending)
+        if nativeInput.read==hook then nativeInput.read=original end
+        if assistHook and phoneAssist.apply==assistHook then phoneAssist.apply=assistOriginal end
+    end
+end
+
+end)()
+-- DEADWIRE TURBO INPUT BRIDGE END
+function Adapter.new(player,progress)
+    assert(type(getgc)=="function","This executor cannot access live simulation tables (TS-GC)")
+    local self=setmetatable({player=player,Input={Read=function() return nil end},Car={NewControls=controls},Arena={},lastScan=-math.huge,lastBind=-math.huge,sequences=setmetatable({}, {__mode="k"}),Running=true},Adapter)
+    self.Coords={Pos=function(v) return Vector3.new(v.x*self.scale,v.z*self.scale,v.y*self.scale) end}
+    self.progress=progress
+    if progress then progress("Turbo Soccer: waiting for active client") end
+    assert(player:WaitForChild("PlayerScripts",120),"Turbo Soccer PlayerScripts timed out")
+    assert(loadedModules().available,"Turbo Soccer needs working loaded-module access in this executor (TS-MODULES)")
+    local deadline=os.clock()+120
+    local client,diagnostic=activeClient(player)
+    while not client and os.clock()<deadline do task.wait(0.25);client,diagnostic=activeClient(player) end
+    self:Bind(assert(client,"Turbo Soccer found no active client ("..diagnostic.loaded.." cached modules, "..diagnostic.scopes.." scopes; TS-CLIENT). Wait for the game to load, then rerun."))
+    self:InitSocial()
+    return self
+end
+function Adapter:Bind(client)
+    if not self.Running then return false end
+    if self.progress then self.progress("Turbo Soccer: loading simulation modules") end
+    if self.restore then self.restore() end
+    local shared=client.Parent.Shared;local sim=assert(shared:WaitForChild("Sim",120),"Turbo Soccer simulation timed out")
+    for _,name in ipairs({"Const","BallPrediction"}) do assert(sim:WaitForChild(name,120),"Missing Turbo Soccer "..name) end
+    local net=assert(shared:WaitForChild("Net",120),"Turbo Soccer networking timed out")
+    assert(client:WaitForChild("Units",120),"Turbo Soccer coordinates timed out")
+    local carModule,nativeCar=resolveModule(sim,"Car",function(v)
+        return type(v.new)=="function" and type(v.copyControls)=="function" and type(v.preTick)=="function" and type(v.postTick)=="function" and type(v.localToWorld)=="function" and type(v.worldToLocal)=="function"
+    end)
+    local protocolModule,protocol=resolveModule(net,"Protocol",function(v)
+        return type(v.CAR_FLAGS)=="table" and #v.CAR_FLAGS==12 and type(v.readControls)=="function" and type(v.writeControls)=="function" and type(v.INPUT_BYTES)=="number"
+    end)
+    local nativeInput=require(client.Input)
+    assert(type(decompile)=="function","Turbo Soccer requires decompile support")
+    if self.progress then self.progress("Turbo Soccer: decompiling car physics") end
+    local src=decompile(carModule)
+    if not self.Running then return false end
+    assert(type(src)=="string" and #src>0,"Turbo Soccer car decompiler returned no source")
+    if self.progress then self.progress("Turbo Soccer: decompiling network protocol") end
+    local protocolSource=decompile(protocolModule)
+    if not self.Running then return false end
+    assert(type(protocolSource)=="string" and #protocolSource>0,"Turbo Soccer protocol decompiler returned no source")
+    local resolveLayout=(function()
+-- Source parsing tolerates decompiler aliases; unknown/ambiguous layouts fail closed.
+local function unique(values,label)
+    local selected
+    for value in pairs(values) do
+        assert(not selected,"Ambiguous Turbo Soccer "..label)
+        selected=value
+    end
+    return selected
+end
+
+local function coordinateFields(car)
+    -- Exercise only the existing pure coordinate helper on frozen synthetic data.
+    -- No live car, simulation object, input hook or game property is passed in.
+    local zero=vector.create(0,0,0)
+    local marker=vector.create(2,3,5)
+    local reads={}
+    local selected
+    local body=table.freeze(setmetatable({}, {
+        __index=function(_,key)
+            assert(type(key)=="string","Unsupported coordinate field")
+            reads[key]=true
+            return key==selected and marker or zero
+        end,
+        __newindex=function() error("Coordinate helper attempted a write") end,
+    }))
+    local object=table.freeze(setmetatable({body=body}, {
+        __index=function() error("Unsupported coordinate helper dependency") end,
+        __newindex=function() error("Coordinate helper attempted a write") end,
+    }))
+    local offsets={zero,vector.create(1,0,0),vector.create(0,1,0),vector.create(0,0,1)}
+    local function evaluate(offset)
+        local value=car.localToWorld(object,offset)
+        local kind=typeof(value)
+        assert(kind=="vector" or kind=="Vector3","Unsupported coordinate result type: "..kind)
+        return vector.create(value.x,value.y,value.z)
+    end
+    for _,offset in ipairs(offsets) do assert(evaluate(offset)==zero,"Coordinate helper has an unexpected offset") end
+    local keys={};for key in pairs(reads) do table.insert(keys,key) end
+    assert(#keys==4 and reads.right and reads.up,"Unsupported coordinate body layout")
+    local roles={}
+    for _,key in ipairs(keys) do
+        selected=key
+        local mask=""
+        for _,offset in ipairs(offsets) do
+            local value=evaluate(offset)
+            assert(value==zero or value==marker,"Unsupported coordinate transform")
+            mask..=value==marker and "1" or "0"
+        end
+        assert(not roles[mask],"Ambiguous coordinate transform")
+        roles[mask]=key
+    end
+    assert(roles["1111"] and roles["0100"] and roles["0010"]=="right" and roles["0001"]=="up","Unsupported coordinate axes")
+    return roles["1111"],roles["0100"]
+end
+
+-- BEGIN FORMAT PARSER
+local tokenize=(function()
+-- Parse decompiler text as data only. Never loadstring/evaluate recovered source.
+return function(source)
+    assert(type(source)=="string" and #source<=2000000,"Turbo Soccer source size is unsupported")
+    local tokens={};local i=1;local started=os.clock()
+    local function add(kind,value) table.insert(tokens,{kind=kind,value=value}) end
+    local function longEnd(at)
+        local equals=source:sub(at):match("^%[(=*)%[")
+        if equals==nil then return nil end
+        local close="]"..equals.."]"
+        local finish=source:find(close,at+#equals+2,true)
+        assert(finish,"Incomplete Turbo Soccer decompiler text")
+        return finish+#close
+    end
+    while i<=#source do
+        if i%2048<8 and task and os.clock()-started>.004 then task.wait();started=os.clock() end
+        local c=source:sub(i,i)
+        if c:match("%s") then i+=1
+        elseif source:sub(i,i+1)=="--" then
+            local finish=longEnd(i+2)
+            i=finish or (source:find("\n",i+2,true) or (#source+1))
+        elseif c=='"' or c=="'" then
+            local quote=c;local parts={};local closed=false;i+=1
+            while i<=#source do
+                c=source:sub(i,i)
+                if c==quote then i+=1;closed=true;break end
+                if c=="\\" then
+                    i+=1;local escaped=source:sub(i,i)
+                    if escaped:match("%d") then
+                        local digits=source:sub(i):match("^%d%d?%d?")
+                        local value=tonumber(digits);assert(value and value<=255,"Unsupported string escape")
+                        table.insert(parts,string.char(value));i+=#digits
+                    elseif escaped=="x" then
+                        local hex=source:sub(i+1,i+2);assert(hex:match("^%x%x$"),"Unsupported string escape")
+                        table.insert(parts,string.char(tonumber(hex,16)));i+=3
+                    else
+                        local values={n="\n",r="\r",t="\t"}
+                        table.insert(parts,values[escaped] or escaped);i+=1
+                    end
+                else table.insert(parts,c);i+=1 end
+            end
+            assert(closed,"Incomplete Turbo Soccer string literal")
+            add("string",table.concat(parts))
+        elseif c:match("[%a_]") then
+            local last=i+1
+            while source:sub(last,last):match("[%w_]") do last+=1 end
+            add("id",source:sub(i,last-1));i=last
+        elseif c:match("%d") then
+            local last=i+1;while source:sub(last,last):match("%d") do last+=1 end
+            add("number",source:sub(i,last-1));i=last
+        else
+            local finish=c=="[" and longEnd(i)
+            if finish then add("opaque","");i=finish
+            else add("symbol",c);i+=1 end
+        end
+    end
+    local canonical={};i=1;local previous
+    while i<=#tokens do
+        local token=tokens[i]
+        if token.value=="[" and tokens[i+1] and tokens[i+1].kind=="string" and tokens[i+1].value:match("^[%a_][%w_]*$") and tokens[i+2] and tokens[i+2].value=="]" then
+            table.insert(canonical,"."..tokens[i+1].value);previous={kind="id"};i+=3
+        else
+            if previous and (previous.kind=="id" or previous.kind=="number") and (token.kind=="id" or token.kind=="number") then table.insert(canonical," ") end
+            table.insert(canonical,token.kind=="string" and '"<literal>"' or token.value)
+            previous=token;i+=1
+        end
+    end
+    return table.concat(canonical),tokens
+end
+
+end)()
+local function timerFields(tokens,protocol)
+    local candidates={}
+    local function consider(fields)
+        if #fields~=13 or fields[1]~="boost" or fields[7]~="supersonicTime" then return end
+        local seen={}
+        for i=1,13 do
+            local field=fields[i]
+            if type(field)~="string" or not field:match("^[%a_][%w_]*$") or seen[field] then return end
+            seen[field]=true
+        end
+        candidates[table.concat(fields,"\0")]=fields
+    end
+    for i,token in ipairs(tokens) do
+        if token.value=="{" then
+            local fields={};local index=1;local j=i+1;local valid=true
+            while tokens[j] and tokens[j].value~="}" do
+                local t=tokens[j]
+                if t.value=="[" and tokens[j+1] and tokens[j+1].kind=="number" and tokens[j+2] and tokens[j+2].value=="]" and tokens[j+3] and tokens[j+3].value=="=" then
+                    index=tonumber(tokens[j+1].value);j+=4;t=tokens[j]
+                end
+                if not t or t.kind~="string" or index<1 or index>13 or fields[index] then valid=false;break end
+                fields[index]=t.value;index+=1;j+=1
+                if tokens[j] and (tokens[j].value=="," or tokens[j].value==";") then j+=1
+                elseif not tokens[j] or tokens[j].value~="}" then valid=false;break end
+            end
+            if valid and tokens[j] and tokens[j].value=="}" then consider(fields) end
+        end
+    end
+    -- Some decompilers expand literal arrays into indexed assignments.
+    local expanded={}
+    for i,t in ipairs(tokens) do
+        if t.kind=="id" and tokens[i+1] and tokens[i+1].value=="[" and tokens[i+2] and tokens[i+2].kind=="number"
+            and tokens[i+3] and tokens[i+3].value=="]" and tokens[i+4] and tokens[i+4].value=="=" and tokens[i+5] and tokens[i+5].kind=="string" then
+            local row=expanded[t.value] or {fields={}};expanded[t.value]=row
+            local index=tonumber(tokens[i+2].value)
+            if index>=1 and index<=13 then
+                if row.fields[index] and row.fields[index]~=tokens[i+5].value then row.conflict=true end
+                row.fields[index]=tokens[i+5].value
+            else row.conflict=true end
+        end
+    end
+    for _,row in pairs(expanded) do if not row.conflict then consider(row.fields) end end
+    local selected,count=nil,0
+    for _,fields in pairs(candidates) do selected=fields;count+=1 end
+    assert(count==1,"Turbo Soccer timer layout: "..(count==0 and "no verified 13-field list" or "conflicting verified lists").." (TS-TIMERS)")
+    assert(type(protocol.CAR_FLAGS)=="table" and #protocol.CAR_FLAGS==12,"Turbo Soccer flag layout changed (TS-FLAGS)")
+    return selected
+end
+
+local function expandAliases(source)
+    local definitions,counts={},{}
+    for name in source:gmatch("([%w_]+)=%f[^=]") do counts[name]=(counts[name] or 0)+1 end
+    for name in source:gmatch("([%w_]+)[%+%-%*/%%%^]=") do counts[name]=(counts[name] or 0)+1 end
+    local declarations={}
+    for name in source:gmatch("local ([%w_]+)") do declarations[name]=(declarations[name] or 0)+1 end
+    for parameters in source:gmatch("function%s*[%w_%.:]*%((.-)%)") do
+        for name in parameters:gmatch("[%a_][%w_]*") do counts[name]=(counts[name] or 0)+1 end
+    end
+    for variables in source:gmatch("for (.-) in ") do
+        for name in variables:gmatch("[%a_][%w_]*") do counts[name]=(counts[name] or 0)+1 end
+    end
+    for name,value,after in source:gmatch("local ([%w_]+)=([%w_%.]+)()") do
+        local nextChar=source:sub(after,after)
+        if counts[name]==1 and declarations[name]==1 and #value<=128 and (nextChar=="" or nextChar==";" or nextChar:match("%s")) then definitions[name]=value end
+    end
+    local aliases={}
+    for _=1,4 do
+        for name,value in pairs(definitions) do
+            value=aliases[value] or value
+            if value=="vector.normalize" or value=="vector.dot" or value:match("^[%w_%.]+%.CAR_MAX_SPEED$")
+                or value:match("^[%w_%.]+%.CAR_MAX_ANG_SPEED$") then aliases[name]=value end
+        end
+    end
+    -- Never rewrite property names; only standalone immutable local bindings.
+    return source:gsub("()([%a_][%w_]*)",function(at,name)
+        local previous=source:sub(at-1,at-1)
+        return previous~="." and previous~=":" and aliases[name] or name
+    end)
+end
+
+local function formatEvidence(tokens,report,bytes)
+    if not report then return end
+    local hits={}
+    for i,t in ipairs(tokens) do if t.value=="CAR_MAX_ANG_SPEED" then hits[#hits+1]=i end end
+    pcall(report,"Car source bytes="..bytes.."; angular cap references="..#hits)
+    local known={vector=true,normalize=true,dot=true,math=true,sqrt=true,localToWorld=true,
+        CAR_MAX_ANG_SPEED=true,CAR_MAX_SPEED=true,["local"]=true,["if"]=true,["then"]=true,["end"]=true}
+    for n=1,math.min(3,#hits) do
+        local ids,count={},0;local parts={}
+        for i=math.max(1,hits[n]-18),math.min(#tokens,hits[n]+24) do
+            local t=tokens[i];local value=t.value
+            if t.kind=="id" or t.kind=="string" then
+                if not known[value] then
+                    if not ids[value] then count+=1;ids[value]="v"..count end
+                    value=ids[value]
+                end
+            elseif t.kind=="number" then value=value=="2" and "2" or "N" end
+            parts[#parts+1]=value
+        end
+        -- Tokens are anonymized, bounded data; never export recovered source.
+        pcall(report,"Angular shape "..n..": "..table.concat(parts," "):sub(1,300))
+    end
+end
+
+local function cappedFields(source,constant)
+    local fields={};local normalizers={["vector.normalize"]=true}
+    local function add(reference)
+        local field=reference:match("%.([%w_]+)$")
+        if field then fields[field]=true end
+    end
+    -- Direct or aliased normalize call, with optional redundant parentheses.
+    local suffix="([%w_%.]+)%."..constant.."%f[^%w_]"
+    for left,normalizer,arg in source:gmatch("([%w_%.]+)=%(*([%w_%.]+)%(%(*([%w_%.]+)%)*%)*%*%(*"..suffix) do
+        if left==arg and normalizers[normalizer] then add(left) end
+    end
+    for left,_,normalizer,arg in source:gmatch("([%w_%.]+)=%(*"..suffix.."%)*%*%(*([%w_%.]+)%(%(*([%w_%.]+)%)*") do
+        if left==arg and normalizers[normalizer] then add(left) end
+    end
+    -- Delta snapshots the vector into a temporary immediately before clamping.
+    -- Match adjacent statements only, so intervening writes/scopes cannot be
+    -- mistaken for an alias of the destination. Compare full qualified paths.
+    local snapshot="local ([%w_]+)=%(*([%w_%.]+)%)*;? ?"
+    for temp,reference,left,normalizer,arg in source:gmatch(snapshot.."([%w_%.]+)=%(*([%w_%.]+)%(%(*([%w_%.]+)%)*%)*%*%(*"..suffix) do
+        if reference==left and temp==arg and normalizers[normalizer] then add(left) end
+    end
+    for temp,reference,left,_,normalizer,arg in source:gmatch(snapshot.."([%w_%.]+)=%(*"..suffix.."%)*%*%(*([%w_%.]+)%(%(*([%w_%.]+)%)*") do
+        if reference==left and temp==arg and normalizers[normalizer] then add(left) end
+    end
+    -- The squared-speed guard is equivalent evidence if normalization was inlined.
+    for a,b in source:gmatch(constant.."%f[^%w_]%)*%^2%)*<%(*vector%.dot%(%(*([%w_%.]+)%)*,%(*([%w_%.]+)%)*%)") do
+        if a==b then add(a) end
+    end
+    for a,b in source:gmatch("vector%.dot%(%(*([%w_%.]+)%)*,%(*([%w_%.]+)%)*%)%)*>%(*[%w_%.]+%."..constant.."%f[^%w_]%)*%^2") do
+        if a==b then add(a) end
+    end
+    return fields
+end
+
+return function(src,protocolSource,protocol,nativeCar,report)
+    local source,tokens=tokenize(src)
+    source=expandAliases(source)
+    local _,protocolTokens=tokenize(protocolSource)
+    local object,pos,other,fwd=source:match("return %(*([%w_]+)%.([%w_]+)%+([%w_]+)%.([%w_]+)%*")
+    if object~=other then pos=nil;fwd=nil end
+    if not pos or not fwd then
+        local ok,p,f=pcall(coordinateFields,nativeCar)
+        assert(ok,"Turbo Soccer coordinate helper layout is not recognized: "..tostring(p))
+        pos,fwd=p,f
+    end
+    local velocities=cappedFields(source,"CAR_MAX_SPEED")
+    for reference in source:gmatch("%.tickVel=%(*([%w_%.]+)") do
+        local field=reference:match("%.([%w_]+)$")
+        if field then velocities[field]=true end
+    end
+    local vel=unique(velocities,"velocity field")
+    local angular=unique(cappedFields(source,"CAR_MAX_ANG_SPEED"),"angular velocity field")
+    local missing={}
+    for key,value in pairs({position=pos~=nil,forward=fwd~=nil,velocity=vel~=nil,angular=angular~=nil}) do if not value then table.insert(missing,key) end end
+    table.sort(missing)
+    if #missing>0 then formatEvidence(tokens,report,#src) end
+    assert(#missing==0,"Turbo Soccer physics layout: missing "..table.concat(missing,", ").." (TS-PHYSICS)")
+    assert(pos~=fwd and pos~=vel and pos~=angular and fwd~=vel and fwd~=angular and vel~=angular,"Overlapping Turbo Soccer physics fields")
+    return {pos=pos,forward=fwd,vel=vel,angVel=angular},timerFields(protocolTokens,protocol)
+end
+
+end)()
+    if self.progress then self.progress("Turbo Soccer: reading physics layout") end
+    self.fields,self.floats=resolveLayout(src,protocolSource,protocol,nativeCar,function(message)
+        local logs=getgenv().DeadWireDiagnostics
+        if logs then logs:Add("INFO","Turbo format",message) end
+    end)
+    if self.progress then self.progress("Turbo Soccer: loading simulation constants") end
+    self.flags=protocol.CAR_FLAGS
+    self.const=require(sim.Const);assert(self.const.TICK_RATE==120,"Unsupported Turbo Soccer tick rate")
+    self.scale=require(client.Units).SCALE
+    if self.progress then self.progress("Turbo Soccer: creating ball predictor") end
+    self.prediction=require(sim.BallPrediction).new()
+    if not self.Running then return false end
+    self.client=client;self.nativeCar=nativeCar;self.nativeInput=nativeInput;self.source=nil;self.target=nil;self.lastBind=os.clock()
+    self.replayInstance=nil;self.replayClass=nil
+    local replay=client:FindFirstChild("Replay")
+    if replay then local ok,value=pcall(require,replay);if ok then self.replayClass=value end end
+    local phoneAssist
+    local module=client:FindFirstChild("PhoneAssist")
+    if module and loadedModules().set[module] then
+        local ok,value=pcall(require,module)
+        if ok and type(value)=="table" and type(value.apply)=="function" then phoneAssist=value end
+    end
+    if self.progress then self.progress("Turbo Soccer: binding native input") end
+    if not self.Running then return false end
+    self.restore=bindInput(self,nativeInput,phoneAssist)
+end
+function Adapter:Physics(object)
+    local body=object.body;local f=self.fields
+    assert(body and (typeof(body[f.pos])=="vector" or typeof(body[f.pos])=="Vector3"),"Turbo Soccer state is unavailable")
+    return {pos=body[f.pos],vel=body[f.vel],angVel=body[f.angVel],rot={forward=body[f.forward],right=body.right,up=body.up}}
+end
+function Adapter:State(car)
+    local s=self:Physics(car);local f=self.floats;local flags=self.flags
+    s.boost=car.boost;s.jumpTime=car[f[2]];s.flipTime=car[f[3]];s.airTimeSinceJump=car[f[4]];s.airTime=car[f[13]]
+    s.handbrakeVal=car[f[6]];s.boostingTime=car[f[9]];s.flipRelTorque=car.flipRelTorque
+    s.isOnGround=car[flags[1]];s.hasJumped=car[flags[2]];s.hasDoubleJumped=car[flags[3]];s.hasFlipped=car[flags[4]];s.isFlipping=car[flags[7]];s.isDemoed=car[flags[12]]
+    s.lastControls=car.lastControls
+    return s
+end
+function Adapter:FindSource()
+    if not self.Running or self.rebinding then return nil end
+    if self.scanning then return self.source end
+    local now=os.clock()
+    if now-self.lastBind>1 then
+        -- Discovery/decompile may yield. Heartbeat, prediction and inference
+        -- readers must not start duplicate native rebinds during game join.
+        self.lastBind=now;self.rebinding=true
+        local ok=pcall(function()
+            local c=activeClient(self.player)
+            if self.Running and c and c~=self.client then self:Bind(c) end
+        end)
+        self.rebinding=false
+        if not ok then error("Turbo Soccer client rebind failed; retrying (TS-REBIND)",0) end
+        if not self.Running then return nil end
+    end
+    if self.source then
+        local tick=self.source.state.tick
+        if tick~=self.sourceTick then self.sourceTick=tick;self.lastAdvance=now end
+        local targetMatches=self.source.session or self.source.state.car.controls==self.target
+        if targetMatches and now-(self.lastAdvance or 0)<0.5 then return self.source end
+    end
+    if self.scanning or now-self.lastScan<0.4 then return self.source end
+    self.scanning=true;self.lastScan=now
+    -- Native inventory calls can fail transiently. Always release this guard,
+    -- otherwise one error prevents simulation rediscovery for the whole session.
+    local scanOK,best=pcall(function()
+    local best,rank=nil,-1;local budget=os.clock()
+    for index,t in ipairs(getgc(true)) do
+        if not self.Running then return nil end
+        if index%4000==0 and os.clock()-budget>0.003 then task.wait();budget=os.clock() end
+        if type(t)=="table" and (type(rawget(t,"match"))=="table" and type(rawget(t,"own"))=="number"
+            or type(rawget(t,"pads"))=="table" and type(rawget(t,"unlimitedBoost"))=="boolean") then
+        local ok,candidate,priority=pcall(function()
+            local match=rawget(t,"match")
+            if type(match)=="table" and type(rawget(t,"own"))=="number" and not t.spectating and type(t.localCar)=="function" then
+                local car=t:localCar()
+                if car and car.body and type(match.tick)=="number" then return {state=match,session=t},4 end
+            end
+            -- Sealed simulation objects expose normal reads but intentionally have no raw fields.
+            if type(t.tick)=="number" and type(t.car)=="table" and type(t.ball)=="table" and type(t.car.body)=="table" and (typeof(t.car.body[self.fields.pos])=="vector" or typeof(t.car.body[self.fields.pos])=="Vector3") then
+                return {state=t},t.car.controls==self.target and 5 or 1
+            end
+        end)
+        if ok and candidate then
+            local prior=self.sequences[candidate.state];local tick=candidate.state.tick
+            self.sequences[candidate.state]=tick
+            priority=priority*10+(prior and prior~=tick and 2 or prior==nil and 1 or 0)
+            if priority>rank then best=candidate;rank=priority end
+        end
+    end end
+    return best
+    end)
+    self.scanning=false
+    if not scanOK then error("Turbo Soccer simulation scan failed; retrying (TS-SCAN)",0) end
+    if not self.Running then return nil end
+    self.source=best;self.sourceTick=best and best.state.tick;self.lastAdvance=now
+    return best
+end
+function Adapter:GetPredictor()
+    local source=self:FindSource();if not source then return nil end
+    local state=source.state;local session=source.session
+    local frame={seq=state.tick,tick=state.tick,lastSnapshotTick=session and 0 or -1,carsById={}}
+    local own=session and session.index or 1
+    local function add(car,id,team)
+        local proxy={id=id,team=team,native=car}
+        function proxy:GetState() return self.adapter:State(self.native) end
+        proxy.adapter=self;frame.carsById[id]=proxy
+    end
+    if session then for i,record in ipairs(state.cars) do if not record.vacant then add(record.car,record.index or i,record.team) end end
+    else add(state.car,1,0) end
+    function frame:LocalCar() return self.carsById[own] end
+    if not frame:LocalCar() then return nil end
+    local ball=state.ball;local arena={boostPads={},gameMode="FOOTBALL"}
+    if session and state.config.game~="soccar" or not session and state.arena then arena.gameMode="UNSUPPORTED" end
+    arena.ball={GetState=function() return self:Physics(ball) end}
+    for _,pad in ipairs(state.pads.pads) do table.insert(arena.boostPads,{pos=pad[self.fields.pos],isActive=pad.isActive,cooldown=pad.cooldown}) end
+    frame.arena=arena;self.frame=frame;self.nativeBall=ball
+    return frame
+end
+function Adapter:Predict(seconds)
+    local frame=self:GetPredictor();assert(frame and frame.arena.gameMode=="FOOTBALL","Waiting for Turbo Soccer football state")
+    local began=os.clock();local result=self.prediction:run(self.nativeBall,seconds,6)
+    self.Bounces={}
+    for _,hit in ipairs(result.bounces) do
+        local pos=hit[self.fields.pos]
+        if pos then table.insert(self.Bounces,{pos=pos}) end
+    end
+    return table.clone(result.points),(os.clock()-began)*1000
+end
+function Adapter:MatchInfo()
+    local source=self.source
+    if not source then return {} end
+    local state=source.state;local session=source.session
+    local own=session and state.cars[session.index]
+    local confirmation=self.confirmedGoal
+    local confirmed=session~=nil and confirmation~=nil and confirmation.session==session and state.phase=="goal"
+    local phase=session and state.phase or "freeplay"
+    if phase=="goal" and not confirmed then phase="play" end
+    return {phase=phase,goalConfirmed=confirmed,stats=own and own.stats,source=state,session=session,
+        ownIndex=session and session.index,lastTouch=state.lastTouch,
+        score=confirmed and {blue=confirmation.blue,orange=confirmation.orange} or nil,scoringTeam=confirmed and confirmation.team or nil,
+        goalThreshold=self.const.GOAL_SCORE_THRESHOLD_Y+self.const.BALL_RADIUS}
+end
+-- Turbo social integration uses the existing UI senders and server events.
+function Adapter:InitSocial()
+    self.socialEvents={};self.confirmedGoal=nil;self.lastHorn=-math.huge
+    local match=game:GetService("ReplicatedStorage"):FindFirstChild("Match")
+    local event=match and match:FindFirstChild("Event")
+    if not event or not event:IsA("RemoteEvent") then return end
+    self.socialConnection=event.OnClientEvent:Connect(function(message)
+        if not self.Running or type(message)~="table" then return end
+        local session=self.source and self.source.session
+        if not session then return end
+        local kind=message.kind
+        if kind=="goal" then
+            self.confirmedGoal={session=session,blue=message.blue,orange=message.orange,team=message.team,at=os.clock()}
+        end
+        if kind=="say" or kind=="goal" or kind=="horn" then
+            if #self.socialEvents>=32 then table.remove(self.socialEvents,1) end
+            table.insert(self.socialEvents,{kind=kind,phrase=message.phrase,index=message.index,
+                scorer=message.scorer,team=message.team,blue=message.blue,orange=message.orange,
+                session=session,at=os.clock()})
+            if kind=="horn" and message.index==session.index then self.lastHorn=os.clock() end
+        end
+    end)
+end
+function Adapter:SocialBindings()
+    if self.socialScanning then return end
+    if self.socialClient==self.client and self.quickChatUI and self.hornUI then return end
+    if os.clock()-(self.lastSocialScan or -math.huge)<10 then return end
+    self.lastSocialScan=os.clock();self.socialClient=self.client;self.quickChatUI=nil;self.hornUI=nil
+    local classes={}
+    for _,module in ipairs(loadedModules().list) do
+        if module.Parent==self.client and (module.Name=="QuickChatUi" or module.Name=="HornWheel") then
+            local ok,class=pcall(require,module)
+            if ok then classes[module.Name]=class end
+        end
+    end
+    if not next(classes) then return end
+    self.socialScanning=true
+    local started=os.clock()
+    for i,value in ipairs(getgc(true)) do
+        if not self.Running then self.socialScanning=false;return end
+        if i%3000==0 and os.clock()-started>0.002 then task.wait();started=os.clock() end
+        if type(value)=="table" and type(rawget(value,"hooks"))=="table" then
+            local class=getmetatable(value)
+            if classes.QuickChatUi and class==classes.QuickChatUi and value.gui and value.gui.Parent and type(value.hooks.say)=="function" then self.quickChatUI=value end
+            if classes.HornWheel and class==classes.HornWheel and value.gui and value.gui.Parent and type(value.hooks.pick)=="function" then self.hornUI=value end
+        end
+    end
+    self.socialScanning=false
+end
+function Adapter:DrainSocialEvents()
+    local events=self.socialEvents or {};self.socialEvents={};return events
+end
+function Adapter:SendQuickChat(phrase)
+    if not self.Running or not self.source or not self.source.session then return false end
+    local session=self.source.session
+    self:SocialBindings()
+    if not self.Running or not self.source or self.source.session~=session then return false end
+    local ui=self.quickChatUI
+    if not ui or ui.isOpen or ui:waitLeft()>0 then return false end
+    local valid={quedefesa=true,boa=true,passa=true,obrigado=true}
+    if not valid[phrase] then return false end
+    -- Same timestamp and callback as QuickChatUi:pick, including manual cooldown.
+    ui.sentAt=os.clock();ui.hooks.say(phrase)
+    return true
+end
+function Adapter:SendHorn()
+    if not self.Running or not self.source or not self.source.session or os.clock()-self.lastHorn<10 then return false end
+    local session=self.source.session
+    self:SocialBindings()
+    if not self.Running or not self.source or self.source.session~=session then return false end
+    local ui=self.hornUI
+    if not ui or ui.isOpen or not ui.horns[1] then return false end
+    self.lastHorn=os.clock();ui.hooks.pick(1);return true
+end
+
+function Adapter:SkipReplay()
+    if not self.replayClass then return false,"Replay control unavailable" end
+    if not self.source or not self.source.session or not self:MatchInfo().goalConfirmed then return false,"Waiting for goal replay" end
+    if not self.replayInstance or not self.replayInstance.playing then
+        if os.clock()-(self.lastReplayScan or -math.huge)<2 then return false,"Waiting for replay" end
+        self.lastReplayScan=os.clock()
+        for _,value in ipairs(getgc(true)) do
+            if type(value)=="table" and rawget(value,"skipButton") and getmetatable(value)==self.replayClass and value.playing then
+                self.replayInstance=value;break
+            end
+        end
+    end
+    local replay=self.replayInstance
+    if replay and replay.playing and type(replay.onSkip)=="function" and not replay.voted then
+        replay:skip();return true,"Skip vote sent"
+    end
+    return false,replay and replay.voted and "Skip already requested" or "Waiting for replay"
+end
+function Adapter:Stop()
+    if not self.Running then return end
+    self.Running=false;if self.restore then self.restore() end
+    if self.socialConnection then self.socialConnection:Disconnect();self.socialConnection=nil end
+end
+return Adapter
