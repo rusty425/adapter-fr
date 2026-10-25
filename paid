@@ -1,0 +1,1251 @@
+-- Dead Wire: console output is disabled locally for this module.
+local print,warn=function(...) end,function(...) end
+-- DEADWIRE SINGLE STARTUP BEGIN
+local startupEnv=getgenv()
+if startupEnv.DeadWireClientStarting then
+    local logs=startupEnv.DeadWireDiagnostics
+    if logs and type(logs.Add)=="function" then
+        pcall(logs.Add,logs,"INFO","Startup","Already starting; wait for the current startup")
+    end
+    return nil
+end
+local startupLease={}
+startupEnv.DeadWireClientStarting=startupLease
+local function startOnce()
+-- BEGIN DEADWIRE DIAGNOSTICS
+local createDiagnostics=(function()
+-- Private in-memory support log. No files, network, game logs or global hooks.
+return function(ctx)
+    ctx=ctx or {}
+    local log={Entries={},Revision=0,Omitted=0,MaxEntries=150,Version="2026.10.23-logs.7"}
+    local clock=ctx.clock or os.clock
+    local function secretName(name)
+        name=name:lower():gsub("[^%w]","")
+        return name:find("token",1,true) or name:find("key",1,true) or name:find("license",1,true)
+            or name:find("password",1,true) or name:find("authorization",1,true)
+            or name:find("cookie",1,true) or name:find("hwid",1,true) or name=="deviceid"
+    end
+    function log:Sanitize(value,limit)
+        local text=type(value)=="string" and value or type(value)=="number" and tostring(value) or "Unspecified error"
+        -- Redact before truncating: a credential crossing the cutoff must not leak.
+        if #text>16384 then return "Oversized error details omitted" end
+        if ctx.secrets then
+            local ok,secrets=pcall(ctx.secrets)
+            if ok and type(secrets)=="table" then
+                for _,secret in ipairs(secrets) do
+                    if type(secret)=="string" and #secret>0 then
+                        text=text:gsub(secret:gsub("(%W)","%%%1"),function() return "[redacted]" end)
+                    end
+                end
+            end
+        end
+        text=text:gsub("https?://[^%s<>\"']+","[URL omitted]")
+        -- Omit the whole message if it contains a credential assignment. This
+        -- also covers values placed on another line in formatted JSON/errors.
+        for name in text:gmatch("([%w_%-]+)[\"']?%s*[:=]") do
+            if secretName(name) then return "[sensitive details omitted]" end
+        end
+        local lines={}
+        for line in (text.."\n"):gmatch("(.-)\n") do
+            local sensitive=false
+            for name in line:gmatch("([%w_%-]+)[\"']?%s*[:=]") do
+                if secretName(name) then sensitive=true;break end
+            end
+            if sensitive then line="[sensitive details omitted]" end
+            lines[#lines+1]=line
+        end
+        text=table.concat(lines,"\n"):gsub("[%w_%-]+",function(word)
+            -- Do not export unlabelled opaque session/device/credential strings.
+            return #word>=24 and "[opaque value omitted]" or word
+        end):gsub("[%z\1-\8\11\12\14-\31\127]","")
+        limit=limit or 640
+        if #text>limit then text=text:sub(1,limit).." [truncated]" end
+        return text
+    end
+    local function stamp()
+        if ctx.timestamp then
+            local ok,value=pcall(ctx.timestamp)
+            if ok and type(value)=="string" then return value:sub(1,32) end
+        end
+        return string.format("+%.1fs",clock())
+    end
+    function log:Add(level,source,message)
+        level=(level=="ERROR" or level=="WARN") and level or "INFO"
+        source=self:Sanitize(source,96);message=self:Sanitize(message)
+        local now=clock();local last=self.Entries[#self.Entries]
+        if last and last.Level==level and last.Source==source and last.Message==message and now-last.At<5 then
+            last.Count+=1;last.At=now;last.Last=stamp()
+        else
+            if #self.Entries>=self.MaxEntries then table.remove(self.Entries,1);self.Omitted+=1 end
+            self.Entries[#self.Entries+1]={Level=level,Source=source,Message=message,At=now,First=stamp(),Last=stamp(),Count=1}
+        end
+        self.Revision+=1
+    end
+    function log:Clear()
+        table.clear(self.Entries);self.Omitted=0;self.Revision+=1
+        if self.ClearSaved then pcall(self.ClearSaved) end
+    end
+    function log:Line(entry)
+        local repeatText=entry.Count>1 and " (x"..entry.Count..", last "..entry.Last..")" or ""
+        return "["..entry.First.."] "..entry.Level.." / "..entry.Source..": "..entry.Message..repeatText
+    end
+    function log:Recent()
+        local rows={}
+        for i=math.max(1,#self.Entries-7),#self.Entries do rows[#rows+1]=self:Line(self.Entries[i]) end
+        return #rows>0 and table.concat(rows,"\n\n") or "No log entries."
+    end
+    function log:Export()
+        local rows={"Dead Wire support log","Build: "..self.Version}
+        if ctx.context then
+            local ok,values=pcall(ctx.context)
+            if ok and type(values)=="table" then
+                for _,name in ipairs({"Edition","Runtime","Executor","Game","Mode","Bot","Enabled","Transport","Tick","RTT","Errors",
+                    "LastAttemptMs","ClientPrepareMs","ClientTransportMs","ClientDecodeMs","ServerBridgeMs","ServerComputeMs","LastRejectedMs","ControlState","ControlHoldSeconds"}) do
+                    local value=values[name]
+                    if type(value)=="boolean" then value=tostring(value) end
+                    if type(value)=="string" or type(value)=="number" then rows[#rows+1]=name..": "..self:Sanitize(value,120) end
+                end
+            end
+        end
+        rows[#rows+1]="Recent entries: "..#self.Entries.." / "..self.MaxEntries.."; older entries omitted: "..self.Omitted
+        rows[#rows+1]=""
+        for _,entry in ipairs(self.Entries) do rows[#rows+1]=self:Line(entry) end
+        -- Re-sanitize entries too, in case a credential changed since insertion.
+        local clean={}
+        for _,row in ipairs(rows) do clean[#clean+1]=self:Sanitize(row,900) end
+        return table.concat(clean,"\n")
+    end
+    function log:CleanReport(text)
+        if type(text)~="string" or #text>150000 or not text:match("^Dead Wire support log") then return nil end
+        local rows={}
+        for line in (text.."\n"):gmatch("(.-)\n") do
+            if #rows>=250 then break end
+            rows[#rows+1]=self:Sanitize(line,900)
+        end
+        return table.concat(rows,"\n")
+    end
+    function log:CopyText(text)
+        if type(ctx.copy)=="function" then
+            local ok=pcall(ctx.copy,text)
+            if ok then return true,"copied" end
+        end
+        if type(ctx.manualCopy)=="function" then
+            local ok=pcall(ctx.manualCopy,text)
+            if ok then return true,"manual" end
+        end
+        self:Add("WARN","Logs","Clipboard unavailable; the log can still be viewed here.")
+        return false,"unavailable"
+    end
+    function log:Copy() return self:CopyText(self:Export()) end
+    return log
+end
+
+end)()
+local createStartupJournal=(function()
+-- Two fixed, bounded, redacted startup reports. No per-frame file writes.
+return function(ctx)
+    local journal={Previous=nil,Available=type(ctx.write)=="function",Saved=false}
+    local function read(path)
+        if type(ctx.read)~="function" then return nil end
+        local ok,value=pcall(ctx.read,path)
+        if not ok or type(value)~="string" or #value>150000 then return nil end
+        return ctx.clean(value)
+    end
+    local function write(path,text)
+        if not journal.Available then return false end
+        local ok,result=pcall(ctx.write,path,text)
+        if not ok or result==false then journal.Available=false;return false end
+        return true
+    end
+    local last=read(ctx.path)
+    journal.Previous=last or read(ctx.previousPath)
+    if last then write(ctx.previousPath,last) end
+    function journal:Save()
+        self.Saved=write(ctx.path,ctx.current())
+        return self.Saved
+    end
+    function journal:Clear()
+        self.Previous=nil
+        write(ctx.previousPath,"")
+        self:Save()
+    end
+    return journal
+end
+
+end)()
+-- Roblox adapter for the embedded, bounded support log.
+local diagnosticsEnv=getgenv()
+local executor="Unknown"
+if type(identifyexecutor)=="function" then
+    local ok,name,version=pcall(identifyexecutor)
+    if ok and type(name)=="string" then executor=name..(type(version)=="string" and " "..version or "") end
+end
+local copyGui
+local function closeCopy()
+    if copyGui then copyGui:Destroy();copyGui=nil end
+end
+local function manualCopy(text)
+    closeCopy()
+    local player=game:GetService("Players").LocalPlayer
+    local parent=player and player:FindFirstChild("PlayerGui")
+    assert(parent,"Player UI is unavailable")
+    local gui=Instance.new("ScreenGui");copyGui=gui
+    gui.Name="DeadWireCopyLogs";gui.ResetOnSpawn=false;gui.DisplayOrder=1650
+    local frame=Instance.new("Frame");frame.Size=UDim2.new(.9,0,.65,0);frame.Position=UDim2.new(.05,0,.15,0)
+    frame.BackgroundColor3=Color3.fromRGB(24,24,30);frame.Parent=gui
+    local title=Instance.new("TextLabel");title.Size=UDim2.new(1,-55,0,44);title.Position=UDim2.fromOffset(12,4)
+    title.BackgroundTransparency=1;title.TextColor3=Color3.new(1,1,1);title.TextSize=14;title.TextWrapped=true
+    title.Text="Copy logs: select the text below and copy it manually.";title.Parent=frame
+    local close=Instance.new("TextButton");close.Size=UDim2.fromOffset(32,32);close.Position=UDim2.new(1,-38,0,7)
+    close.Text="X";close.TextSize=18;close.Parent=frame;close.Activated:Connect(closeCopy)
+    local scroll=Instance.new("ScrollingFrame");scroll.Size=UDim2.new(1,-24,1,-62);scroll.Position=UDim2.fromOffset(12,50)
+    scroll.BackgroundColor3=Color3.fromRGB(32,32,40);scroll.AutomaticCanvasSize=Enum.AutomaticSize.XY
+    scroll.CanvasSize=UDim2.fromOffset(0,0);scroll.Parent=frame
+    local box=Instance.new("TextBox");box.Size=UDim2.new(1,-12,0,100);box.AutomaticSize=Enum.AutomaticSize.Y
+    box.Position=UDim2.fromOffset(6,6);box.BackgroundTransparency=1;box.TextColor3=Color3.fromRGB(230,230,235)
+    box.TextSize=13;box.Font=Enum.Font.Code;box.TextXAlignment=Enum.TextXAlignment.Left;box.TextYAlignment=Enum.TextYAlignment.Top
+    box.ClearTextOnFocus=false;box.MultiLine=true;box.RichText=false;box.TextWrapped=true;box.TextEditable=false
+    box.Text=text;box.Parent=scroll;gui.Parent=parent
+    pcall(function() box:CaptureFocus();box.CursorPosition=#text+1;box.SelectionStart=1 end)
+end
+local Diagnostics
+Diagnostics=createDiagnostics({
+    timestamp=function() return os.date("!%Y-%m-%d %H:%M:%S").."Z" end,
+    secrets=function() return {diagnosticsEnv.RiftPolicyToken or ""} end,
+    copy=function(text)
+        local copy=setclipboard or toclipboard or (syn and syn.write_clipboard)
+        assert(type(copy)=="function","Clipboard API unavailable")
+        assert(copy(text)~=false,"Clipboard rejected")
+    end,
+    manualCopy=manualCopy,
+    context=function()
+        local url=diagnosticsEnv.RiftPolicyURL
+        local values={Edition="Paid",Executor=executor,
+            Runtime=type(url)=="string" and url:match("^http://127%.0%.0%.1:") and "Owner local" or "Hosted",
+            Game=game.GameId==10767012496 and "Turbo Soccer" or game.GameId==10769066324 and "Bloks League" or "Unknown"}
+        if Diagnostics.Context then
+            local ok,extra=pcall(Diagnostics.Context)
+            if ok and type(extra)=="table" then for key,value in pairs(extra) do values[key]=value end end
+        end
+        return values
+    end,
+})
+Diagnostics.CloseView=closeCopy
+diagnosticsEnv.DeadWireDiagnostics=Diagnostics
+local journalEdition="Paid"
+if type(diagnosticsEnv.RiftPolicyURL)=="string" and diagnosticsEnv.RiftPolicyURL:match("^http://127%.0%.0%.1:") then journalEdition="Local-"..journalEdition end
+Diagnostics.Journal=createStartupJournal({path="DW-Startup-"..journalEdition..".log",previousPath="DW-Previous-"..journalEdition..".log",
+    read=readfile,write=writefile,clean=function(text) return Diagnostics:CleanReport(text) end,current=function() return Diagnostics:Export() end})
+Diagnostics.Checkpoint=function() Diagnostics.Journal:Save() end
+Diagnostics.YieldStartup=function() task.wait() end
+Diagnostics.ClearSaved=function() Diagnostics.Journal:Clear() end
+function Diagnostics:CopyPrevious()
+    if not self.Journal.Previous then return false,"empty" end
+    local text=self:CleanReport(self.Journal.Previous)
+    if not text then return false,"empty" end
+    return self:CopyText(text)
+end
+Diagnostics:Add("INFO","Startup","Client starting")
+
+-- END DEADWIRE DIAGNOSTICS
+-- Dead Wire visible startup wrapper
+local startup=(function()
+-- Local startup visibility. Never prints credentials or performs activation itself.
+return function(product,logs)
+    local env=getgenv()
+    local state={product=product,phase="Starting client",status="loading",startedAt=os.clock()}
+    env.DeadWireStartupStatus=state
+    local gui,label
+    pcall(function()
+        local player=game:GetService("Players").LocalPlayer
+        if not player then return end
+        local parent=player:WaitForChild("PlayerGui",5)
+        if not parent then return end
+        local old=parent:FindFirstChild("DeadWireStartup")
+        if old then old:Destroy() end
+        gui=Instance.new("ScreenGui");gui.Name="DeadWireStartup";gui.ResetOnSpawn=false;gui.DisplayOrder=1600
+        local frame=Instance.new("Frame");frame.AnchorPoint=Vector2.new(.5,0);frame.Position=UDim2.new(.5,0,0,65)
+        frame.Size=UDim2.new(.9,0,0,175);frame.BackgroundColor3=Color3.fromRGB(24,24,30);frame.Parent=gui
+        local limit=Instance.new("UISizeConstraint");limit.MaxSize=Vector2.new(490,175);limit.Parent=frame
+        local title=Instance.new("TextLabel");title.Size=UDim2.new(1,-45,0,30);title.Position=UDim2.fromOffset(12,6)
+        title.BackgroundTransparency=1;title.TextColor3=Color3.new(1,1,1);title.TextSize=17;title.TextXAlignment=Enum.TextXAlignment.Left;title.Text=product;title.Parent=frame
+        label=Instance.new("TextLabel");label.Size=UDim2.new(1,-24,1,-82);label.Position=UDim2.fromOffset(12,37)
+        label.BackgroundTransparency=1;label.TextColor3=Color3.fromRGB(215,215,225);label.TextSize=14;label.TextWrapped=true
+        label.TextXAlignment=Enum.TextXAlignment.Left;label.TextYAlignment=Enum.TextYAlignment.Top;label.Parent=frame
+        local close=Instance.new("TextButton");close.Size=UDim2.fromOffset(30,30);close.Position=UDim2.new(1,-34,0,4)
+        close.BackgroundTransparency=1;close.Text="X";close.TextColor3=Color3.new(1,1,1);close.TextSize=16;close.Parent=frame
+        close.Activated:Connect(function() gui:Destroy();gui=nil;label=nil end)
+        if logs then
+            local copy=Instance.new("TextButton");copy.Size=UDim2.fromOffset(130,28);copy.Position=UDim2.new(0,12,1,-34)
+            copy.Text="Copy Logs";copy.TextSize=14;copy.Parent=frame
+            copy.Activated:Connect(function()
+                local ok,mode=logs:Copy()
+                copy.Text=ok and (mode=="manual" and "Select text to copy" or "Copied!") or "Copy unavailable"
+            end)
+            if logs.CopyPrevious then
+                local previous=Instance.new("TextButton");previous.Size=UDim2.fromOffset(150,28);previous.Position=UDim2.new(0,150,1,-34)
+                previous.Text="Copy Previous Startup";previous.TextSize=12;previous.Parent=frame
+                previous.Activated:Connect(function()
+                    local ok=logs:CopyPrevious();previous.Text=ok and "Previous report copied" or "No previous report"
+                end)
+            end
+        end
+        gui.Parent=parent
+    end)
+    local startup={}
+    function startup:Set(phase)
+        state.phase=phase
+        if logs then logs:Add("INFO","Startup",phase) end
+        if logs and logs.Checkpoint then logs.Checkpoint() end
+        if label then label.Text=phase end
+        -- Let the lightweight HUD render before entering a potentially blocking
+        -- executor/compiler call. This cannot preempt that native call itself.
+        if state.status=="loading" and logs and logs.YieldStartup then logs.YieldStartup() end
+        task.delay(25,function()
+            if env.DeadWireStartupStatus==state and state.status=="loading" and state.phase==phase and label then
+                label.Text=phase.."\nStill waiting. If this persists, send this stage to support."
+                if logs then logs:Add("WARN","Startup","Still waiting: "..phase) end
+            end
+        end)
+    end
+    function startup:Fail(reason)
+        reason=tostring(reason)
+        local token=env.RiftPolicyToken
+        if type(token)=="string" and #token>0 then reason=reason:gsub(token:gsub("(%W)","%%%1"),"[session redacted]") end
+        if logs then
+            logs:Add("ERROR","Startup / "..state.phase,reason);reason=logs:Sanitize(reason)
+            if logs.Checkpoint then logs.Checkpoint() end
+        end
+        state.status="failed";state.error=reason
+        if label then label.Text="Stopped at: "..state.phase.."\n"..reason;label.TextColor3=Color3.fromRGB(255,160,150) end
+        warn("Dead Wire startup ["..state.phase.."]: "..reason)
+    end
+    function startup:Finish()
+        state.status="ready";state.phase="Panel ready"
+        if logs then logs:Add("INFO","Startup","Panel ready") end
+        if logs and logs.Checkpoint then logs.Checkpoint() end
+        if logs then logs.Stage=nil end
+        if gui then gui:Destroy();gui=nil;label=nil end
+    end
+    if logs then logs.Stage=function(phase) startup:Set(phase) end end
+    startup:Set(state.phase)
+    return startup
+end
+
+end)()("Dead Wire | Paid",Diagnostics)
+local adapterForCleanup,botForCleanup
+local function runClient()
+-- Recovered Rift policy selector and ball prediction. Start rift_policy_server.py first.
+-- Set getgenv().RiftPolicyToken to the server's session token before running.
+-- F6: enable/pause; F7: unload. Optional smoothing, manual priority and goal pause.
+local env = getgenv()
+local edition="paid"
+local blackout=edition=="blackout"
+local workshop=true
+local product="Dead Wire | Paid"
+local branding={Nyx="Blackout",["TromsoFR-Newest"]="Circuit",["TromsoFR-19.5B (Arsenal Resets)"]="Arc",["TromsoAD-Preflip"]="Pulse"}
+local allowed=blackout and {Nyx=true} or {["TromsoFR-Newest"]=true,["TromsoFR-19.5B (Arsenal Resets)"]=true,["TromsoAD-Preflip"]=true}
+branding["TromsoFR-Newest"]="Circuit";allowed["TromsoFR-Newest"]=true
+branding["TromsoFR-19.5B (Arsenal Resets)"]="Arc";allowed["TromsoFR-19.5B (Arsenal Resets)"]=true
+branding["TromsoAD-Preflip"]="Pulse";allowed["TromsoAD-Preflip"]=true
+branding["Nyx"]="Blackout";allowed["Nyx"]=true
+branding["Experimental"]="Static";allowed["Experimental"]=true
+branding["KusoV1.5"]="Relay II";allowed["KusoV1.5"]=true
+branding["KusoV1"]="Relay I";allowed["KusoV1"]=true
+branding["KusoV2.5_2v2"]="Relay Duo I";allowed["KusoV2.5_2v2"]=true
+branding["KusoV2.9_2v2"]="Relay Duo II";allowed["KusoV2.9_2v2"]=true
+branding["KusoV2_Lightweight_Version"]="Relay Lite";allowed["KusoV2_Lightweight_Version"]=true
+branding["KusoV2_Max_Version"]="Relay Max";allowed["KusoV2_Max_Version"]=true
+branding["KusoV3_2v2"]="Relay Duo III";allowed["KusoV3_2v2"]=true
+branding["SkyBot"]="Skyline I";allowed["SkyBot"]=true
+branding["SkyBotV2"]="Skyline II";allowed["SkyBotV2"]=true
+branding["SkyBotV3"]="Skyline III";allowed["SkyBotV3"]=true
+branding["SysoBot-Multi"]="Vector Multi";allowed["SysoBot-Multi"]=true
+branding["SysoBotV1"]="Vector I";allowed["SysoBotV1"]=true
+branding["SysoBotV2"]="Vector II";allowed["SysoBotV2"]=true
+branding["SysoBotV2_1v1"]="Vector Solo";allowed["SysoBotV2_1v1"]=true
+branding["TromsoBump"]="Impact";allowed["TromsoBump"]=true
+branding["TromsoGP"]="Surge";allowed["TromsoGP"]=true
+branding["Necto"]="Necto";allowed["Necto"]=true
+if env.BloksLeagueBot and env.BloksLeagueBot.Stop then env.BloksLeagueBot:Stop() end
+if env.BloksLeagueRiftPolicy then env.BloksLeagueRiftPolicy:Stop() end
+local profilePath="DeadWire-"..edition..".json"
+local profile={}
+pcall(function() profile=game:GetService("HttpService"):JSONDecode(readfile(profilePath)) end)
+if type(profile)~="table" then profile={} end
+local function bounded(value,default,lo,hi)
+    value=tonumber(value)
+    return type(value)=="number" and value==value and math.clamp(value,lo,hi) or default
+end
+local resume=env.RiftPolicyTeleportResume
+env.RiftPolicyTeleportResume=nil
+if resume and resume.Edition~=edition then resume=nil end
+if not game:IsLoaded() then game.Loaded:Wait() end
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local UIS = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local Http = game:GetService("HttpService")
+local player=Players.LocalPlayer
+while not player do Players:GetPropertyChangedSignal("LocalPlayer"):Wait();player=Players.LocalPlayer end
+local function child(parent,name)
+    return assert(parent:WaitForChild(name,180),"Timed out waiting for "..name)
+end
+startup:Set("Finding game modules")
+-- DEADWIRE RUNTIME COMPAT BEGIN
+local RuntimeCompat=(function()
+-- Scoped executor adapters; never replace globals or retry an HTTP request.
+local Compat={}
+function Compat.First(...)
+    for i=1,select("#",...) do local v=select(i,...);if type(v)=="function" then return v end end
+end
+local function member(value,key)
+    if value==nil then return end
+    local ok,result=pcall(function() return value[key] end)
+    if ok then return result end
+end
+function Compat.HTTP(e)
+    local send=Compat.First(e.request,e.http_request,e.httpRequest,e.httprequest,
+        member(e.syn,"request"),member(e.http,"request"),member(e.fluxus,"request"))
+    if not send then return nil end
+    return function(options)
+        local ok,response=pcall(send,options)
+        if not ok or type(response)~="table" then
+            return {StatusCode=0,Body="HTTP request failed",Success=false}
+        end
+        local status=tonumber(response.StatusCode or response.Status)
+        if not status or status%1~=0 or status<100 or status>599 then
+            return {StatusCode=0,Body="HTTP response status unavailable",Success=false}
+        end
+        return {StatusCode=status,Body=type(response.Body)=="string" and response.Body or "",
+            Success=status>=200 and status<300,Headers=response.Headers}
+    end
+end
+local function signal(value)
+    if type(member(value,"Connect"))=="function" then return value end
+    local event=member(value,"Event")
+    if type(member(event,"Connect"))=="function" then return event end
+    error("WebSocket signal unavailable")
+end
+function Compat.WebSocket(e)
+    local synSocket=member(e.syn,"websocket")
+    local connect=Compat.First(member(e.WebSocket,"connect"),member(e.WebSocket,"Connect"),member(e.WebSocket,"new"),member(e.WebSocket,"New"),
+        member(e.websocket,"connect"),member(e.websocket,"Connect"),member(e.websocket,"new"),member(e.websocket,"New"),
+        member(synSocket,"connect"),member(synSocket,"Connect"))
+    if not connect then return nil end
+    return {connect=function(url)
+        local original=connect(url)
+        local ok,result=pcall(function()
+            local send,close=member(original,"Send"),member(original,"Close")
+            assert(type(send)=="function" and type(close)=="function","WebSocket methods unavailable")
+            local proxy={OnMessage=signal(member(original,"OnMessage")),OnClose=signal(member(original,"OnClose"))}
+            function proxy:Send(message)
+                -- nil is a successful void return; explicit false means send failed.
+                assert(send(original,message)~=false,"WebSocket send failed")
+            end
+            function proxy:Close() close(original) end
+            return proxy
+        end)
+        if not ok then
+            local close=member(original,"Close")
+            if type(close)=="function" then pcall(close,original) end
+            error("WebSocket interface unavailable")
+        end
+        return result
+    end}
+end
+function Compat.ParentGui(gui,hidden,core,playerGui,protect)
+    local candidates={}
+    local function add(v)
+        if typeof(v)=="Instance" then table.insert(candidates,v) end
+    end
+    if type(hidden)=="function" then local ok,v=pcall(hidden);if ok then add(v) end end
+    local ok,robloxGui=pcall(function() return core:FindFirstChild("RobloxGui") end)
+    if ok then add(robloxGui) end
+    add(core);add(playerGui)
+    if type(protect)=="function" then pcall(protect,gui) end
+    for _,parent in ipairs(candidates) do
+        local assigned=pcall(function() gui.Parent=parent;assert(gui.Parent~=nil) end)
+        if assigned then return gui.Parent end
+    end
+    error("Panel container unavailable")
+end
+return Compat
+
+end)()
+-- DEADWIRE RUNTIME COMPAT END
+-- DEADWIRE SIMULATION CAPABILITY
+assert(type(getgc)=="function","This executor cannot access live simulation tables (DW-GC)")
+local GameAdapter
+local Input,Car,Arena,Coords
+if game.GameId==10767012496 then
+    local transport=RuntimeCompat.HTTP({request=request,http_request=http_request,httpRequest=httpRequest,httprequest=httprequest,syn=syn,http=http,fluxus=fluxus})
+    assert(type(transport)=="function","HTTP request support is required")
+    local response=transport({Url=(env.RiftPolicyURL or "http://127.0.0.1:49173").."/adapters/turbo",Method="GET",Headers={["X-Rift-Token"]=env.RiftPolicyToken},Timeout=5})
+    assert(response and response.StatusCode==200,"Cannot load Turbo Soccer adapter")
+    startup:Set("Compiling Turbo Soccer adapter")
+local factory,err=loadstring(response.Body,"DeadWire-TurboSoccer")
+    assert(factory,err);GameAdapter=factory().new(player,function(stage) startup:Set(stage) end);adapterForCleanup=GameAdapter
+    Input,Car,Arena,Coords=GameAdapter.Input,GameAdapter.Car,GameAdapter.Arena,GameAdapter.Coords
+else
+    local client=child(child(player,"PlayerScripts"),"Client")
+    local sim=child(child(RS,"Shared"),"Sim")
+    Input=require(child(client,"Input"));Car=require(child(sim,"Car"))
+    Arena=require(child(sim,"Arena"));Coords=require(child(client,"Coords"))
+end
+local send=RuntimeCompat.HTTP({request=request,http_request=http_request,httpRequest=httpRequest,httprequest=httprequest,syn=syn,http=http,fluxus=fluxus})
+assert(type(send) == "function", "HTTP request support is required")
+assert(type(env.RiftPolicyToken) == "string" and #env.RiftPolicyToken > 0, "Dead Wire session missing; rerun the loader")
+local url = env.RiftPolicyURL or "http://127.0.0.1:49173"
+local token = env.RiftPolicyToken
+-- DEADWIRE SOCKET ADAPTER
+local WebSocket=RuntimeCompat.WebSocket({WebSocket=WebSocket,websocket=websocket,syn=syn})
+local StreamFactory=(function()
+-- One outstanding request, bounded wait, and HTTP fallback on the next request.
+local Http = game:GetService("HttpService")
+return function(url, token, httpSend)
+    local connect = (WebSocket and WebSocket.connect) or (websocket and websocket.connect)
+        or (syn and syn.websocket and syn.websocket.connect)
+    local socket, ready, connecting, closed = nil, false, false, false
+    local sequence, pending, retryAt = 0, {}, 0
+    local events = {}
+    local transport = {Mode="HTTP"}
+    local function drop()
+        ready=false; transport.Mode="HTTP"
+        for _, event in ipairs(events) do pcall(function() event:Disconnect() end) end
+        events={}
+        local old=socket; socket=nil
+        if old then pcall(function() old:Close() end) end
+    end
+    local function start()
+        if closed or connecting or ready or not connect or os.clock()<retryAt then return end
+        connecting=true; retryAt=os.clock()+15
+        task.spawn(function()
+            local ok=pcall(function()
+                local ws=connect(url:gsub("^https:","wss:"):gsub("^http:","ws:").."/stream")
+                if closed then ws:Close(); return end
+                socket=ws
+                table.insert(events,ws.OnMessage:Connect(function(raw)
+                    local decoded,message=pcall(Http.JSONDecode,Http,raw)
+                    if not decoded or socket~=ws then return end
+                    if message.type=="auth" then
+                        ready=message.status==200
+                        transport.Mode=ready and "WebSocket" or "HTTP"
+                    elseif message.id and pending[message.id] then pending[message.id].response=message end
+                end))
+                table.insert(events,ws.OnClose:Connect(function()
+                    if socket==ws then ready=false;socket=nil;transport.Mode="HTTP" end
+                end))
+                ws:Send(Http:JSONEncode({type="auth",token=token}))
+                local deadline=os.clock()+5
+                while not ready and socket==ws and not closed and os.clock()<deadline do task.wait() end
+                if not ready then drop() end
+            end)
+            if not ok then drop() end
+            connecting=false
+        end)
+    end
+    function transport:Infer(snapshot,body)
+        start()
+        if ready and socket then
+            sequence+=1
+            local id=sequence
+            local slot={};pending[id]=slot
+            local ok=pcall(function() socket:Send(Http:JSONEncode({type="infer",id=id,snapshot=snapshot})) end)
+            local deadline=os.clock()+2
+            while ok and ready and not slot.response and not closed and os.clock()<deadline do task.wait() end
+            pending[id]=nil
+            if slot.response then
+                return {StatusCode=slot.response.status,Body=Http:JSONEncode(slot.response.data)}
+            end
+            drop()
+            error("Stream interrupted; controls released")
+        end
+        return httpSend({Url=url.."/infer",Method="POST",Headers={
+            ["Content-Type"]="application/json",["X-Rift-Token"]=token},Body=body,Timeout=2})
+    end
+    function transport:Close() closed=true;drop() end
+    start()
+    return transport
+end
+
+end)()
+local StreamTransport=StreamFactory(url,token,send)
+local HostedTiming=(function()
+-- Bounded timing for remote inference. No change to the local edition.
+local Timing = {}
+Timing.MaxResponseAge = 0.65
+Timing.MaxObservationAge = 0.85
+Timing.MaxTickAge = math.ceil(Timing.MaxResponseAge * 120)
+function Timing.Accept(elapsed, tickAge, tickSkip)
+    if elapsed ~= elapsed or elapsed < 0 or elapsed > Timing.MaxResponseAge then
+        return false, "Hosted reply too slow (" .. tostring(math.floor(elapsed * 1000)) .. "ms; limit 650ms)"
+    end
+    if tickAge < 0 or tickAge > math.max(Timing.MaxTickAge, tickSkip * 3) then
+        return false, "Hosted reply belongs to an old simulation tick"
+    end
+    return true
+end
+function Timing.Fresh(now, received, observed, roundTrip)
+    local hold = math.clamp((roundTrip or 0) * 1.5 + 0.05, 0.3, 0.65)
+    return now >= received and now - received < hold
+        and now >= observed and now - observed < Timing.MaxObservationAge
+end
+return Timing
+
+end)()
+local controlObservedAt=-math.huge
+local lastRoundTrip=0
+
+startup:Set("Loading panel interface")
+local uiResponse=send({Url=url.."/ui/deadwire",Method="GET",Headers={["X-Rift-Token"]=token},Timeout=3})
+assert(uiResponse and uiResponse.StatusCode==200,"Cannot load Dead Wire UI from the hosted backend")
+startup:Set("Compiling panel wrapper")
+local uiChunk,uiError=loadstring(uiResponse.Body,"DeadWire-Yoru")
+assert(uiChunk,uiError)
+local Library=uiChunk()
+startup:Set("Creating panel window")
+local Window=Library:CreateWindow({Title="Dead Wire | Paid",SubTitle="All Bots",
+    TabWidth=110,Size=UDim2.fromOffset(500,540),Acrylic=false,Theme="Dark",MinimizeKey=Enum.KeyCode.RightControl})
+-- Fluent retains the normal drag position even while its window is maximized.
+local function windowBounds()
+    local viewport=workspace.CurrentCamera.ViewportSize
+    local size=Window:GetSize()
+    return viewport,math.max(0,viewport.X-size.X),math.max(0,viewport.Y-size.Y)
+end
+local function captureWindowPosition()
+    return Window:GetPosition() or {X=0,Y=0}
+end
+local function restoreWindowPosition(value)
+    if type(value)~="table" or type(value.X)~="number" or type(value.Y)~="number"
+        or value.X~=value.X or value.Y~=value.Y or math.abs(value.X)==math.huge or math.abs(value.Y)==math.huge then return false end
+    local _,maxX,maxY=windowBounds()
+    Window:SetPosition(math.clamp(value.X,0,maxX),math.clamp(value.Y,0,maxY))
+    return true
+end
+restoreWindowPosition(resume and resume.WindowPosition or profile.WindowPosition)
+local Bot = {Running=true, Enabled=false, Status="Paused", Stats={Decisions=0, Errors=0, Reads=0},
+    SelectedMode=(resume or profile).SelectedMode,Model=(allowed[profile.Model] and profile.Model or "TromsoFR-Newest"), Models={}, TickSkip=bounded((resume or profile).TickSkip,2,1,24), PredictionEnabled=(resume or profile).PredictionEnabled~=false, PredictionSeconds=bounded((resume or profile).PredictionSeconds,3,1,6),Edition=edition,Product=product,StreamId=Http:GenerateGUID(false)}
+if resume and allowed[resume.Model] then Bot.Model=resume.Model end
+env.BloksLeagueRiftPolicy = Bot;botForCleanup=Bot
+Bot.Game=GameAdapter and "Turbo Soccer" or "Bloks League"
+Bot.GameAdapter=GameAdapter
+Bot.Diagnostics=Diagnostics
+Diagnostics.Context=function()
+    return {Mode=Bot.SelectedMode or "Unknown",Bot=branding[Bot.Model] or "Unknown",Enabled=Bot.Enabled,
+        Transport=Bot.Stats.Transport or "Connecting",Tick=Bot.Stats.LastTick or "--",
+        RTT=Bot.Stats.RoundTripMs and string.format("%.0fms",Bot.Stats.RoundTripMs) or "--",Errors=Bot.Stats.Errors,
+        LastAttemptMs=Bot.Stats.LastAttemptMs,ClientPrepareMs=Bot.Stats.ClientPrepareMs,
+        ClientTransportMs=Bot.Stats.ClientTransportMs,ClientDecodeMs=Bot.Stats.ClientDecodeMs,
+        ServerBridgeMs=Bot.Stats.ServerBridgeMs,ServerComputeMs=Bot.Stats.ServerComputeMs,LastRejectedMs=Bot.Stats.LastRejectedMs,
+        ControlState=Bot.Stats.ControlState,ControlHoldSeconds=Bot.Stats.ControlHoldSeconds}
+end
+local function saveProfile()
+    local ok,err=pcall(writefile,profilePath,Http:JSONEncode({Model=Bot.Model,SelectedMode=Bot.SelectedMode,
+        PredictionEnabled=Bot.PredictionEnabled,PredictionSeconds=Bot.PredictionSeconds,WindowPosition=captureWindowPosition(),Settings=Bot.Settings,ModeModels=Bot.ModeModels}))
+    if not ok then Diagnostics:Add("ERROR","Settings",err);warn("Dead Wire settings: "..tostring(err)) end
+    if ok then
+        local readOK,saved=pcall(readfile,profilePath)
+        if not readOK then return false,"Cannot verify saved profile" end
+        local parsedOK,data=pcall(Http.JSONDecode,Http,saved)
+        if not parsedOK or type(data.Settings)~="table" then return false,"Saved profile is invalid" end
+    end
+    return ok,err
+end
+local predictor, lastScan = nil, -math.huge
+local predictorSeq, lastAdvance = nil, -math.huge
+local candidateSequences=setmetatable({}, {__mode="k"})
+local originalRead = Input.Read
+local controls, receivedAt, generation = nil, -math.huge, 0
+local lastRequestTick = nil
+local lastAppliedTick = nil
+local connections = {}
+local Features
+Bot.Settings=(resume or profile).Settings or {Smoothing=false,BoostSmoothing=false}
+-- One remembered bot per game mode ("1v1", "2v2", "3v3", "Unverified"). Each mode loads its own bot when a match of that mode starts.
+Bot.ModeModels=(resume or profile).ModeModels or {}
+for mode,name in pairs({["1v1"]="TromsoFR-Newest",["2v2"]="KusoV1",["3v3"]="KusoV1.5"}) do
+    if not allowed[Bot.ModeModels[mode]] then Bot.ModeModels[mode]=name end
+end
+if not allowed[Bot.ModeModels.Unverified] then Bot.ModeModels.Unverified=nil end
+
+-- Profiles saved before per-mode bots keep their single bot as the bot for its mode.
+if Bot.SelectedMode and not Bot.ModeModels[Bot.SelectedMode] then Bot.ModeModels[Bot.SelectedMode]=Bot.Model end
+local queueTeleport=queue_on_teleport or queueonteleport or (syn and syn.queue_on_teleport)
+local ticketPath="RiftPolicyTeleport-"..Bot.StreamId..".json"
+local ticketReady=false
+local savePositionPending=false
+local function saveTeleportState(active)
+    if not ticketReady then return end
+    local ok,err=pcall(writefile,ticketPath,Http:JSONEncode({Active=active,Edition=edition,Model=Bot.Model,SelectedMode=Bot.SelectedMode,
+        Enabled=Bot.Enabled,PredictionEnabled=Bot.PredictionEnabled,PredictionSeconds=Bot.PredictionSeconds,TickSkip=Bot.TickSkip,WindowPosition=captureWindowPosition(),Settings=Bot.Settings,ModeModels=Bot.ModeModels}))
+    if not ok then Diagnostics:Add("ERROR","Settings",err);warn("Dead Wire settings: "..tostring(err)) end
+end
+-- Debounce drag events; teleport/unload always flush synchronously.
+local function saveWindowPosition()
+    saveProfile();saveTeleportState(Bot.Running)
+end
+local function schedulePositionSave()
+    if savePositionPending or not Bot.Running then return end
+    savePositionPending=true
+    task.delay(0.25,function()
+        savePositionPending=false
+        if Bot.Running then saveWindowPosition() end
+    end)
+end
+-- Re-clamp when Roblox changes resolution or switches its camera after a transfer.
+local viewportConnection
+local function watchViewport()
+    if viewportConnection then viewportConnection:Disconnect() end
+    local camera=workspace.CurrentCamera
+    if camera then
+        viewportConnection=camera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+            if Bot.Running then
+                if not Window.Maximized then restoreWindowPosition(captureWindowPosition()) end
+                schedulePositionSave()
+            end
+        end)
+        table.insert(connections,viewportConnection)
+    end
+end
+table.insert(connections,workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+    watchViewport()
+    if Bot.Running then
+        if not Window.Maximized then restoreWindowPosition(captureWindowPosition()) end
+        schedulePositionSave()
+    end
+end))
+watchViewport()
+Bot.Window=Window
+Bot.SaveWindowPosition=saveWindowPosition
+Bot.RestoreWindowPosition=function(_,value) return restoreWindowPosition(value) end
+function Bot:BuildTeleportBootstrap()
+    return string.format([==[
+task.spawn(function()
+    local env=getgenv()
+    local path=%q
+    local ok,state=pcall(function()
+        local value=game:GetService("HttpService"):JSONDecode(readfile(path))
+        if type(delfile)=="function" then pcall(delfile,path) end
+        return value
+    end)
+    if not ok or type(state)~="table" or not state.Active then return end
+    if env.RiftPolicyTeleportClaim==path then return end
+    env.RiftPolicyTeleportClaim=path
+    if not game:IsLoaded() then game.Loaded:Wait() end
+    env.RiftPolicySelectedModel=state.Model
+    env.RiftPolicyTeleportResume=state
+    local loaded,err=pcall(function()
+        loadstring(game:HttpGet("https://cutrr.xyz/v1/l/dbfi9w0j69nkjbjy"))()
+    end)
+    if not loaded then warn("Dead Wire teleport: rerun the Cutrr loader. "..tostring(err)) end
+end)
+]==],ticketPath)
+end
+function Bot:ArmTeleportReload()
+    if type(queueTeleport)~="function" or type(writefile)~="function" or type(readfile)~="function" then
+        self.TeleportStatus="Unavailable: executor needs teleport queue and file APIs";return false
+    end
+    ticketReady=true;saveTeleportState(true)
+    local ok,err=pcall(queueTeleport,self:BuildTeleportBootstrap())
+    self.TeleportStatus=ok and "Armed: settings restore after server transfer" or "Queue failed: "..tostring(err)
+    if not ok then Diagnostics:Add("ERROR","Teleport queue",err) end
+    if not ok then saveTeleportState(false) end
+    return ok
+end
+local function vec(v) return {v.x, v.y, v.z} end
+local function physics(s)
+    local t = {pos=vec(s.pos), vel=vec(s.vel), angVel=vec(s.angVel)}
+    if s.rot then
+        t.forward=vec(s.rot.forward); t.right=vec(s.rot.right); t.up=vec(s.rot.up)
+    end
+    return t
+end
+local names = {"throttle", "steer", "pitch", "yaw", "roll", "jump", "boost", "handbrake"}
+local function packCar(car)
+    local s = car:GetState()
+    local t = physics(s)
+    t.id=car.id; t.team=car.team; t.boost=s.boost
+    t.airTime=s.airTime; t.airTimeSinceJump=s.airTimeSinceJump; t.flipTime=s.flipTime
+    t.jumpTime=s.jumpTime;t.boostingTime=s.boostingTime;t.handbrakeVal=s.handbrakeVal
+    t.flipRelTorque=vec(s.flipRelTorque)
+    for _, name in ipairs({"isOnGround","hasFlipped","hasDoubleJumped","isFlipping","isDemoed","hasJumped"}) do
+        t[name]=s[name] == true
+    end
+    t.lastControls={}
+    for i, name in ipairs(names) do
+        local value=s.lastControls and s.lastControls[name] or 0
+        t.lastControls[i]=type(value)=="boolean" and (value and 1 or 0) or value
+    end
+    return t
+end
+local function findPredictor()
+    if GameAdapter then return GameAdapter:GetPredictor() end
+    local now=os.clock()
+    if predictor and predictor.seq~=predictorSeq then predictorSeq=predictor.seq;lastAdvance=now end
+    if predictor and now-lastAdvance<1 then return predictor end
+    -- A heap scan costs about a second on a loaded client, so it runs rarely: every 3s while no simulation is found, 5s while a stale one is held.
+    if now-lastScan<(predictor and 5 or 3) then return predictor end
+    lastScan=now
+    local best, tick, priority=nil, -math.huge, -1
+    for _, t in ipairs(getgc(true)) do
+        if type(t)=="table" and type(rawget(t,"arena"))=="table"
+            and type(rawget(t,"carsById"))=="table" and type(rawget(t,"seq"))=="number" then
+            local ok, car=pcall(function() return t:LocalCar() end)
+            local previous=candidateSequences[t]
+            local advancing=previous and previous~=t.seq
+            candidateSequences[t]=t.seq
+            local rank=advancing and 2 or (previous==nil and 1 or 0)
+            if ok and car and (rank>priority or rank==priority and (rawget(t,"tick") or -1)>tick) then
+                best=t;tick=t.tick;priority=rank
+            end
+        end
+    end
+    if predictor~=best then predictor=best;predictorSeq=best and best.seq;lastAdvance=now end
+    env.RiftPortPredictor=best
+    return best
+end
+function Bot:Observe()
+    local p=findPredictor()
+    assert(p, "Waiting for local simulation")
+    local car=p:LocalCar()
+    assert(car and p.arena.ball, "Waiting for local car and ball")
+    local others={}
+    for _, other in pairs(p.carsById) do
+        if other.id~=car.id then table.insert(others,packCar(other)) end
+    end
+    table.sort(others,function(a,b) return a.id<b.id end)
+    local pads={}
+    for _, pad in ipairs(p.arena.boostPads) do
+        table.insert(pads,{pos=vec(pad.pos), active=pad.isActive == true, cooldown=pad.cooldown})
+    end
+    local snapshot={tick=p.tick, model=self.Model, car=packCar(car), ball=physics(p.arena.ball:GetState()), others=others,
+        pads=pads, gameMode=p.arena.gameMode, localSimulation=p.lastSnapshotTick == -1,
+        streamId=self.StreamId..":"..tostring(generation)}
+    if Features then
+        local info=GameAdapter and GameAdapter:MatchInfo() or {phase=p.phase or p.arena.phase,source=p}
+        Features:Observe(snapshot,info)
+    end
+    return snapshot
+end
+local function decodeControls(values)
+    assert(type(values)=="table" and #values==8, "Expected eight policy controls")
+    local c=Car.NewControls()
+    for i,name in ipairs(names) do
+        local value=values[i]
+        assert(type(value)=="number" and value==value and math.abs(value)<=1, "Invalid policy action")
+        if i<=5 then c[name]=value else c[name]=value>0.5 end
+    end
+    return c
+end
+local function freshControls()
+    return HostedTiming.Fresh(os.clock(),receivedAt,controlObservedAt,lastRoundTrip)
+end
+local wrapper=function(...)
+    local manual=originalRead(...)
+    Bot.Stats.Reads+=1
+    if GameAdapter then manual=GameAdapter.ManualControls or manual end
+    if Features then return Features:Apply(manual,controls,Bot.Running and freshControls()) end
+    if Bot.Running and Bot.Enabled and controls and freshControls() then
+        return table.clone(controls)
+    end
+    return manual
+end
+Input.Read=wrapper
+-- DEADWIRE POST INPUT VALIDATION BEGIN
+if GameAdapter then
+    GameAdapter.ControlEpoch=function() return controls end
+    GameAdapter.ControlsCurrent=function(epoch)
+        return epoch~=nil and Bot.Running and Bot.Enabled and epoch==controls and freshControls()
+    end
+end
+-- DEADWIRE POST INPUT VALIDATION END
+local tab=Window:AddTab({Title="Paid Bots"})
+Window:AddLogs(Diagnostics)
+local syncingUI=false
+local enabledToggle=tab:AddToggle("DeadWireEnabled",{Title="Enable bot",Description="F6 to enable or disable",Default=false})
+local groupDropdowns={}
+local labelsToModels={};local modelsToLabels={};local modelGroups={}
+local groups={"1v1","2v2","3v3","Unverified"}
+local listedModes={["TromsoFR-Newest"]={"1v1"},["TromsoFR-19.5B (Arsenal Resets)"]={"1v1"},["TromsoAD-Preflip"]={"1v1"},["Nyx"]={"1v1","2v2","3v3"},["Experimental"]={"1v1","2v2"},["KusoV1.5"]={"2v2","3v3"},["KusoV1"]={"2v2"},["KusoV2.5_2v2"]={"2v2"},["KusoV2.9_2v2"]={"2v2"},["KusoV2_Lightweight_Version"]={"2v2"},["KusoV2_Max_Version"]={"2v2"},["KusoV3_2v2"]={"2v2"},["SkyBot"]={"1v1"},["SkyBotV2"]={"1v1"},["SkyBotV3"]={"1v1"},["SysoBot-Multi"]={"Unverified"},["SysoBotV1"]={"Unverified"},["SysoBotV2"]={"Unverified"},["SysoBotV2_1v1"]={"1v1"},["TromsoBump"]={"1v1"},["TromsoGP"]={"1v1"},["Necto"]={"1v1","2v2","3v3"}}
+for _,group in ipairs(groups) do
+    groupDropdowns[group]=tab:AddDropdown("DeadWireModels"..group,{Title=group=="Unverified" and "Unverified modes" or group.." bots",Values={}})
+end
+local function syncModelDropdowns()
+    for _,group in ipairs(groups) do
+        local dropdown=groupDropdowns[group]
+        local remembered=Bot.ModeModels[group]
+        local selected=remembered and modelsToLabels[remembered] or nil
+        if dropdown.Value~=selected then dropdown:SetValue(selected) end
+    end
+end
+Window:SelectTab(1)
+local predictionFolder=Instance.new("Folder");predictionFolder.Name="RiftBallPrediction";predictionFolder.Parent=workspace
+local predictionParts={}
+local function hidePrediction()
+    for _,part in ipairs(predictionParts) do part.Transparency=1 end
+    if Features then Features:HideBounces() end
+end
+function Bot:SetEnabled(value)
+    if value==true then
+        local ready=false
+        for _,entry in ipairs(self.Models) do if entry.name==self.Model and entry.ready then ready=true end end
+        if not ready then
+            value=false
+            Library:Notify({Title="Dead Wire",Content="This bot is decrypted; its game adapter is pending.",Duration=5})
+        end
+    end
+    if self.Enabled~=(value==true) then Diagnostics:Add("INFO","Bot",value==true and "Enabled" or "Paused") end
+    self.Enabled=value == true; generation+=1; controls=nil; receivedAt=-math.huge
+    lastRequestTick=nil
+    lastAppliedTick=nil
+    self.Status=self.Enabled and "Connecting trained policy" or "Paused"
+    saveTeleportState(self.Running)
+end
+function Bot:SelectModel(name)
+    local available=false
+    for _,entry in ipairs(self.Models) do if entry.name==name then available=true end end
+    assert(available and allowed[name],"Model is unavailable in this edition: "..tostring(name))
+    -- Switching bots keeps the bot on: drop the old policy's pending controls, then re-enable on the new model.
+    local wasEnabled=self.Enabled
+    self:SetEnabled(false)
+    self.Model=name
+    Diagnostics:Add("INFO","Bot selected",branding[name] or "Unknown")
+    if modelGroups[name] and not table.find(modelGroups[name],self.SelectedMode) then self.SelectedMode=modelGroups[name][1] end
+    generation+=1;controls=nil;lastRequestTick=nil;lastAppliedTick=nil
+    env.RiftPolicySelectedModel=name
+    saveProfile()
+    self.Stats.LastControls=nil;self.Stats.ActionIndex=nil
+    if wasEnabled then self:SetEnabled(true) end
+    self.Status=self.Enabled and "Switching to "..name or "Paused"
+    saveTeleportState(self.Running)
+end
+function Bot:Stop(fromLibrary)
+    if not self.Running then return end
+    Diagnostics:Add("INFO","Client","Unloaded");Diagnostics.CloseView()
+    saveProfile()
+    self:SetEnabled(false); self.Running=false
+    StreamTransport:Close()
+    saveTeleportState(false)
+    if Features then Features:Destroy() end
+    if Input.Read==wrapper then Input.Read=originalRead end
+    if GameAdapter then GameAdapter:Stop() end
+    for _,c in ipairs(connections) do c:Disconnect() end
+    if not fromLibrary then Library:Destroy() end
+    predictionFolder:Destroy()
+    if env.BloksLeagueRiftPolicy==self then env.BloksLeagueRiftPolicy=nil end
+end
+enabledToggle:OnChanged(function() if not syncingUI then Bot:SetEnabled(enabledToggle.Value) end end)
+for _,group in ipairs(groups) do
+    local dropdown=groupDropdowns[group]
+    dropdown:OnChanged(function(value)
+        if not syncingUI then
+            dropdown:Close()
+            local name=labelsToModels[value]
+            if name then
+                Bot.ModeModels[group]=name
+                if not Bot.DetectedMode or Bot.DetectedMode==group then
+                    Bot.SelectedMode=group
+                    Bot:SelectModel(name)
+                else
+                    saveProfile();saveTeleportState(Bot.Running)
+                end
+                syncingUI=true;syncModelDropdowns();syncingUI=false
+            end
+        end
+    end)
+end
+local destroyLibrary=Library.Destroy
+function Library:Destroy()
+    if Bot.Running then Bot:Stop(true) end
+    return destroyLibrary(self)
+end
+Bot.UI=Library
+Bot.ModelGroups=modelGroups
+startup:Set("Loading controls and features")
+local featureResponse=send({Url=url.."/features",Method="GET",Headers={["X-Rift-Token"]=token},Timeout=5})
+assert(featureResponse and featureResponse.StatusCode==200,"Cannot load Dead Wire controls")
+startup:Set("Compiling controls and features")
+local featureFactory,featureError=loadstring(featureResponse.Body,"DeadWireFeatures")
+assert(featureFactory,featureError)
+Features=featureFactory().new({Bot=Bot,UIS=UIS,RunService=RunService,Library=Library,Window=Window,
+    Car=Car,Coords=Coords,Http=Http,connections=connections,branding=branding,
+    save=saveProfile,saveTeleport=function() saveTeleportState(Bot.Running) end,
+    controlsReady=function() return controls~=nil and Bot.Running and freshControls() end,
+    invalidate=function() generation+=1;controls=nil;receivedAt=-math.huge;lastRequestTick=nil;lastAppliedTick=nil end})
+Library:Show()
+
+table.insert(connections,UIS.InputBegan:Connect(function(input,processed)
+    if processed then return end
+    if input.KeyCode==Enum.KeyCode.F6 then Bot:SetEnabled(not Bot.Enabled)
+    elseif input.KeyCode==Enum.KeyCode.F7 then Bot:Stop() end
+end))
+local lastPosition=nil
+task.spawn(function()
+    while Bot.Running do
+        syncingUI=true
+        if enabledToggle.Value~=Bot.Enabled then enabledToggle:SetValue(Bot.Enabled) end
+        syncModelDropdowns()
+        syncingUI=false
+        Window:SetStatus(Bot.Status)
+        local position=captureWindowPosition()
+        if lastPosition and (position.X~=lastPosition.X or position.Y~=lastPosition.Y) then schedulePositionSave() end
+        lastPosition=position
+        local stats=Bot.Stats
+        Window:SetStats({{"Status",Bot.Status},{"RTT",stats.RoundTripMs and string.format("%.0fms",stats.RoundTripMs) or "--"},
+            {"Pred",string.format("%.1fms",stats.PredictionMs or 0)},{"Dec",stats.Decisions},{"Err",stats.Errors},{"Tick",stats.LastTick or "--"}})
+        task.wait(0.2)
+    end
+end)
+task.spawn(function()
+    while Bot.Running do
+        local began=os.clock()
+        if Bot.Enabled then
+            local current=generation
+            local ok,err=pcall(function()
+                if Features and Features.settings.GoalPause and Features.blocked then
+                    controls=nil;Bot.Status=Features.blockReason;return
+                end
+                local snapshot=Bot:Observe()
+                if Features and Features.settings.GoalPause and Features.blocked then
+                    controls=nil;Bot.Status=Features.blockReason;return
+                end
+                if Features and Features.settings.AutoTakeover and (Features.unfocused or os.clock()-Features.lastManual<Features.settings.TakeoverDelay) then
+                    controls=nil;Bot.Status="Manual control";return
+                end
+                -- DEADWIRE NATIVE INPUT GATE BEGIN
+                if GameAdapter and GameAdapter.LastInputAllowed==false then
+                    controls=nil;Bot.Status="Game input disabled";return
+                end
+                -- DEADWIRE NATIVE INPUT GATE END
+                if snapshot.ball.pos[3]<0 then
+                    controls=nil; Bot.Status="Waiting for goal reset / visible ball"; return
+                end
+                if snapshot.tick==lastRequestTick then
+                    if not freshControls() then controls=nil; Bot.Status="Waiting for simulation ticks" end
+                    return
+                end
+                if lastRequestTick and snapshot.tick>lastRequestTick and snapshot.tick-lastRequestTick<Bot.TickSkip then return end
+                local requestTickGap=lastRequestTick and snapshot.tick-lastRequestTick or 0
+                lastRequestTick=snapshot.tick
+                local body=Http:JSONEncode(snapshot)
+                local submittedAt=os.clock()
+                local response=StreamTransport:Infer(snapshot,body)
+                local transportReturnedAt=os.clock()
+                if Bot.Stats.Transport~=StreamTransport.Mode then Diagnostics:Add("INFO","Connection",StreamTransport.Mode) end
+                Bot.Stats.Transport=StreamTransport.Mode
+                if response and response.StatusCode==403 then
+                    Bot:SetEnabled(false)
+                    error("Session ended or key revoked. Rerun your Cutrr loader to activate again.")
+                end
+                assert(response and response.StatusCode==200,response and response.Body or "No server response")
+                local data=Http:JSONDecode(response.Body)
+                assert(data.tick==snapshot.tick,"Response tick mismatch")
+                assert(data.model==snapshot.model,"Response model mismatch")
+                local candidate=decodeControls(data.controls)
+                local elapsed=os.clock()-began
+                -- DEADWIRE REPLY TIMING: diagnostic values only; cutoff is unchanged.
+                Bot.Stats.LastAttemptMs=elapsed*1000
+                Bot.Stats.ClientPrepareMs=(submittedAt-began)*1000
+                Bot.Stats.ClientTransportMs=(transportReturnedAt-submittedAt)*1000
+                Bot.Stats.ClientDecodeMs=(os.clock()-transportReturnedAt)*1000
+                Bot.Stats.ServerBridgeMs=type(data.serverBridgeMs)=="number" and data.serverBridgeMs or nil
+                Bot.Stats.ServerComputeMs=type(data.computeMs)=="number" and data.computeMs or nil
+                if Bot.Running and Bot.Enabled and current==generation then
+                    Bot.Stats.RoundTripMs=elapsed*1000
+                    local live=findPredictor()
+                    local nowTick=live and live.tick or data.tick
+                    local accepted,reason=HostedTiming.Accept(elapsed,nowTick-data.tick,Bot.TickSkip)
+                    if not accepted then
+                        Bot.Stats.LastRejectedMs=elapsed*1000
+                        Diagnostics:Add("INFO","Reply timing",string.format(
+                            "prepare=%.0fms; transport=%.0fms; decode=%.0fms; bridge=%s; compute=%s; total=%.0fms",
+                            Bot.Stats.ClientPrepareMs,Bot.Stats.ClientTransportMs,Bot.Stats.ClientDecodeMs,
+                            Bot.Stats.ServerBridgeMs and string.format("%.0fms",Bot.Stats.ServerBridgeMs) or "unavailable",
+                            Bot.Stats.ServerComputeMs and string.format("%.1fms",Bot.Stats.ServerComputeMs) or "unavailable",
+                            Bot.Stats.LastAttemptMs))
+                    end
+                    assert(accepted,reason)
+                    controls=candidate; receivedAt=os.clock(); controlObservedAt=began; lastRoundTrip=elapsed
+                    Bot.Stats.Decisions+=1; Bot.Stats.RoundTripMs=elapsed*1000
+                    Bot.Stats.ActionIndex=data.actionIndex; Bot.Stats.ComputeMs=data.computeMs
+                    Bot.Stats.LastTick=data.tick; Bot.Stats.LastControls=data.controls
+                    Bot.Stats.RequestTickGap=requestTickGap
+                    Bot.Stats.AppliedTickGap=lastAppliedTick and nowTick-lastAppliedTick or 0
+                    Bot.Stats.ResponseAgeTicks=nowTick-data.tick
+                    Bot.Stats.Match=data.match
+                    lastAppliedTick=nowTick
+                    local match=data.match
+                    local matchLabel=match and string.format("%dv%d%s",match.ownTeamSize,match.opponents,match.adapted and " adapted" or "") or ""
+                    Bot.Status=matchLabel.." / trained action "..tostring(data.actionIndex)
+                end
+            end)
+            if not ok and current==generation then
+                controls=nil; Bot.Stats.Errors+=1; Bot.Status=tostring(err)
+                Diagnostics:Add("ERROR","Inference",err)
+                if Bot.Stats.Errors<=3 or Bot.Stats.Errors%30==0 then warn("Dead Wire: "..tostring(err)) end
+            end
+        end
+        task.wait(0.001)
+    end
+end)
+task.spawn(function()
+    local ok,err=pcall(function()
+        local response=send({Url=url.."/models",Method="GET",Headers={["X-Rift-Token"]=token},Timeout=2})
+        assert(response.StatusCode==200,response.Body)
+        local models=Http:JSONDecode(response.Body).models
+        if not Bot.Running then return end
+        Bot.Models={}
+        local valuesByGroup={["1v1"]={},["2v2"]={},["3v3"]={},Unverified={}}
+        local filtered={}
+        for _,entry in ipairs(models) do if allowed[entry.name] then
+            table.insert(filtered,entry)
+            local title=(branding[entry.name] or entry.label)..(not entry.ready and " (adapter pending)" or entry.experimental and " (test)" or "")
+            local modes=listedModes[entry.name] or {"Unverified"}
+            modelGroups[entry.name]=modes
+            for _,group in ipairs(modes) do table.insert(valuesByGroup[group],title) end
+            labelsToModels[title]=entry.name;modelsToLabels[entry.name]=title
+        end end
+        Bot.Models=filtered
+        Window:AddBotGuide(filtered,edition)
+        assert(modelsToLabels[Bot.Model],"Selected model is unavailable")
+        if not table.find(modelGroups[Bot.Model],Bot.SelectedMode) then Bot.SelectedMode=modelGroups[Bot.Model][1] end
+        syncingUI=true
+        for _,group in ipairs(groups) do groupDropdowns[group]:SetValues(valuesByGroup[group]) end
+        syncModelDropdowns();syncingUI=false
+        if resume then Bot:SetEnabled(resume.Enabled==true);resume=nil end
+    end)
+    if not ok then Bot.Status="Model list: "..tostring(err);Diagnostics:Add("ERROR","Model catalog",err) end
+end)
+task.spawn(function()
+    local arena,mutators
+    while Bot.Running do
+        if Bot.PredictionEnabled then
+            local ok,err=pcall(function()
+                local p=findPredictor()
+                if not p or p.arena.gameMode~="FOOTBALL" then hidePrediction();return end
+                local state=p.arena.ball:GetState()
+                if state.pos.z<0 then hidePrediction();return end
+                local points;local predictionBegan=os.clock()
+                if GameAdapter then
+                    points,Bot.Stats.PredictionMs=GameAdapter:Predict(Bot.PredictionSeconds)
+                else
+                if not arena or mutators~=p.arena.mutators then
+                    mutators=p.arena.mutators;arena=Arena.New({tickRate=120,mutators=table.clone(mutators)})
+                end
+                arena.ball:SetState(state)
+                arena.freezeGroundedBallFrom=nil;arena.tickCount=p.arena.tickCount
+                points={state.pos}
+                for i=1,math.floor(Bot.PredictionSeconds*120) do
+                    arena:Step()
+                    local nextState=arena.ball:GetState()
+                    if nextState.pos.z<0 then break end
+                    if i%6==0 then table.insert(points,nextState.pos) end
+                end
+                end
+                if not Bot.Running then return end
+                Bot.PredictionPoints=points;Bot.Stats.PredictionMs=(os.clock()-predictionBegan)*1000
+                for i=1,#points-1 do
+                    local a,b=Coords.Pos(points[i]),Coords.Pos(points[i+1])
+                    a=Vector3.new(a.x,a.y,a.z);b=Vector3.new(b.x,b.y,b.z)
+                    local part=predictionParts[i]
+                    if not part then
+                        part=Instance.new("Part");part.Name="PredictedBallPath"
+                        part.Anchored=true;part.CanCollide=false;part.CanTouch=false;part.CanQuery=false
+                        part.CastShadow=false;part.Material=Enum.Material.Neon;part.Parent=predictionFolder
+                        predictionParts[i]=part
+                    end
+                    local distance=(b-a).Magnitude
+                    local pathColor,pathWidth=Features:PathStyle()
+                    part.Color=pathColor
+                    if distance>0.002 then
+                        part.Size=Vector3.new(pathWidth,pathWidth,distance)
+                        part.CFrame=CFrame.lookAt((a+b)/2,b);part.Transparency=0.15
+                    else part.Transparency=1 end
+                end
+                for i=#points,#predictionParts do predictionParts[i].Transparency=1 end
+                Features:RenderBounces(points,GameAdapter and GameAdapter.Bounces)
+
+            end)
+            if not ok then hidePrediction();Bot.Stats.PredictionError=tostring(err);Diagnostics:Add("ERROR","Prediction",err) end
+        else hidePrediction()
+        end
+        task.wait(0.3)
+    end
+end)
+-- Wait for the catalog before committing mode selection; retry failed startup switches.
+local modeNames={[1]="1v1",[2]="2v2",[3]="3v3"}
+local modePredictor,modeArena,modeTick,largestTeamSize=nil,nil,nil,0
+local function currentMode()
+    local p=findPredictor()
+    if not p or not p.carsById then
+        modePredictor=nil;modeArena=nil;modeTick=nil;largestTeamSize=0
+        return nil
+    end
+    if p~=modePredictor or p.arena~=modeArena or (modeTick and p.tick and p.tick<modeTick) then
+        modePredictor=p;modeArena=p.arena;largestTeamSize=0
+    end
+    modeTick=p.tick
+    local blue,orange=0,0
+    for _,car in pairs(p.carsById) do
+        if car.team==0 then blue+=1 elseif car.team==1 then orange+=1 end
+    end
+    -- Do not shrink a match when a player leaves or joins late.
+    local largest=math.max(blue,orange)
+    if largest>=1 and largest<=3 then largestTeamSize=math.max(largestTeamSize,largest) end
+    if blue<1 or orange<1 or blue~=orange then return nil end
+    return modeNames[largestTeamSize]
+end
+local appliedMode=nil
+local modeDefaults={["1v1"]="TromsoFR-Newest",["2v2"]="KusoV1",["3v3"]="KusoV1.5"}
+function Bot:RefreshMode()
+    if #self.Models==0 then return false,"Waiting for model catalog" end
+    local mode=currentMode()
+    if not mode then self.DetectedMode=nil;return false,"Waiting for both teams" end
+    self.DetectedMode=mode
+    local remembered=self.ModeModels[mode]
+    if not remembered or not modelsToLabels[remembered] then return false,"Waiting for saved model" end
+    if not modelGroups[remembered] or not table.find(modelGroups[remembered],mode) then
+        remembered=modeDefaults[mode]
+        if not modelsToLabels[remembered] then return false,"Waiting for mode default" end
+        self.ModeModels[mode]=remembered
+    end
+    if appliedMode==mode and self.SelectedMode==mode and self.Model==remembered then return true end
+    -- Commit only after the actual model switch succeeds.
+    self.SelectedMode=mode
+    if remembered~=self.Model then self:SelectModel(remembered) end
+    appliedMode=mode
+    syncingUI=true;syncModelDropdowns();syncingUI=false
+    return true
+end
+task.spawn(function()
+    while Bot.Running do
+        local ok,selected,reason=pcall(Bot.RefreshMode,Bot)
+        Bot.ModeSelectionStatus=ok and (selected and "Selected "..tostring(Bot.DetectedMode) or reason) or tostring(selected)
+        task.wait(0.5)
+    end
+end)
+
+Bot:ArmTeleportReload()
+table.insert(connections,player.OnTeleport:Connect(function(state)
+    if state==Enum.TeleportState.Started then saveWindowPosition() end
+end))
+print(product.." ready. F6 enables; F7 unloads. Teleport: "..Bot.TeleportStatus)
+return Bot
+
+end
+local ok,result=pcall(runClient)
+if not ok then
+    if botForCleanup and type(botForCleanup.Stop)=="function" then pcall(botForCleanup.Stop,botForCleanup)
+    elseif adapterForCleanup then pcall(adapterForCleanup.Stop,adapterForCleanup) end
+    startup:Fail(result);return nil
+end
+startup:Finish()
+return result
+
+end
+local startupOK,startupResult=pcall(startOnce)
+if startupEnv.DeadWireClientStarting==startupLease then startupEnv.DeadWireClientStarting=nil end
+if not startupOK then error(startupResult,0) end
+return startupResult
+-- DEADWIRE SINGLE STARTUP END
