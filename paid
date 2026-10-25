@@ -14,7 +14,6 @@ startupEnv.DeadWireClientStarting=startupLease
 local function startOnce()
 -- BEGIN DEADWIRE DIAGNOSTICS
 local createDiagnostics=(function()
--- Private in-memory support log. No files, network, game logs or global hooks.
 return function(ctx)
     ctx=ctx or {}
     local log={Entries={},Revision=0,Omitted=0,MaxEntries=150,Version="2026.10.23-logs.7"}
@@ -465,12 +464,13 @@ assert(type(getgc)=="function","This executor cannot access live simulation tabl
 local GameAdapter
 local Input,Car,Arena,Coords
 if game.GameId==10767012496 then
-    local transport=RuntimeCompat.HTTP({request=request,http_request=http_request,httpRequest=httpRequest,httprequest=httprequest,syn=syn,http=http,fluxus=fluxus})
-    assert(type(transport)=="function","HTTP request support is required")
-    local response=transport({Url=(env.RiftPolicyURL or "http://127.0.0.1:49173").."/adapters/turbo",Method="GET",Headers={["X-Rift-Token"]=env.RiftPolicyToken},Timeout=5})
-    assert(response and response.StatusCode==200,"Cannot load Turbo Soccer adapter")
+    startup:Set("Fetching Turbo Soccer adapter from repository")
+    local success, adapterBody = pcall(function()
+        return game:HttpGet("https://raw.githubusercontent.com/rusty425/adapter-fr/main/adapter")
+    end)
+    assert(success and type(adapterBody) == "string" and #adapterBody > 0, "Failed to fetch adapter from repository")
     startup:Set("Compiling Turbo Soccer adapter")
-    local factory,err=loadstring(response.Body,"DeadWire-TurboSoccer")
+    local factory,err=loadstring(adapterBody,"DeadWire-TurboSoccer")
     assert(factory,err);GameAdapter=factory().new(player,function(stage) startup:Set(stage) end);adapterForCleanup=GameAdapter
     Input,Car,Arena,Coords=GameAdapter.Input,GameAdapter.Car,GameAdapter.Arena,GameAdapter.Coords
 else
@@ -712,9 +712,9 @@ task.spawn(function()
     env.RiftPolicySelectedModel=state.Model
     env.RiftPolicyTeleportResume=state
     local loaded,err=pcall(function()
-        loadstring(game:HttpGet("https://cutrr.xyz/v1/l/dbfi9w0j69nkjbjy"))()
+        loadstring(game:HttpGet("https://raw.githubusercontent.com/rusty425/adapter-fr/main/paid"))()
     end)
-    if not loaded then warn("Dead Wire teleport: rerun the Cutrr loader. "..tostring(err)) end
+    if not loaded then warn("Dead Wire teleport: rerun loader. "..tostring(err)) end
 end)
 ]==],ticketPath)
 end
@@ -1172,7 +1172,7 @@ function Bot:RefreshMode()
     self.DetectedMode=mode
     local remembered=self.ModeModels[mode]
     if not remembered or not modelsToLabels[remembered] then return false,"Waiting for saved model" end
-    if not modelGroups[remembered] or not table.find(modelGroups[remembered],mode) then
+    if not modelGroups[remembered] or not table.find(modelGroups[remarsss=remembered] and modelGroups[remembered],mode) then
         remembered=modeDefaults[mode]
         if not modelsToLabels[remembered] then return false,"Waiting for mode default" end
         self.ModeModels[mode]=remembered
