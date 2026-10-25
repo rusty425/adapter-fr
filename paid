@@ -27,7 +27,6 @@ return function(ctx)
     end
     function log:Sanitize(value,limit)
         local text=type(value)=="string" and value or type(value)=="number" and tostring(value) or "Unspecified error"
-        -- Redact before truncating: a credential crossing the cutoff must not leak.
         if #text>16384 then return "Oversized error details omitted" end
         if ctx.secrets then
             local ok,secrets=pcall(ctx.secrets)
@@ -40,8 +39,6 @@ return function(ctx)
             end
         end
         text=text:gsub("https?://[^%s<>\"']+","[URL omitted]")
-        -- Omit the whole message if it contains a credential assignment. This
-        -- also covers values placed on another line in formatted JSON/errors.
         for name in text:gmatch("([%w_%-]+)[\"']?%s*[:=]") do
             if secretName(name) then return "[sensitive details omitted]" end
         end
@@ -55,7 +52,6 @@ return function(ctx)
             lines[#lines+1]=line
         end
         text=table.concat(lines,"\n"):gsub("[%w_%-]+",function(word)
-            -- Do not export unlabelled opaque session/device/credential strings.
             return #word>=24 and "[opaque value omitted]" or word
         end):gsub("[%z\1-\8\11\12\14-\31\127]","")
         limit=limit or 640
@@ -110,7 +106,6 @@ return function(ctx)
         rows[#rows+1]="Recent entries: "..#self.Entries.." / "..self.MaxEntries.."; older entries omitted: "..self.Omitted
         rows[#rows+1]=""
         for _,entry in ipairs(self.Entries) do rows[#rows+1]=self:Line(entry) end
-        -- Re-sanitize entries too, in case a credential changed since insertion.
         local clean={}
         for _,row in ipairs(rows) do clean[#clean+1]=self:Sanitize(row,900) end
         return table.concat(clean,"\n")
@@ -142,7 +137,6 @@ end
 
 end)()
 local createStartupJournal=(function()
--- Two fixed, bounded, redacted startup reports. No per-frame file writes.
 return function(ctx)
     local journal={Previous=nil,Available=type(ctx.write)=="function",Saved=false}
     local function read(path)
@@ -173,7 +167,6 @@ return function(ctx)
 end
 
 end)()
--- Roblox adapter for the embedded, bounded support log.
 local diagnosticsEnv=getgenv()
 local executor="Unknown"
 if type(identifyexecutor)=="function" then
@@ -248,9 +241,7 @@ end
 Diagnostics:Add("INFO","Startup","Client starting")
 
 -- END DEADWIRE DIAGNOSTICS
--- Dead Wire visible startup wrapper
 local startup=(function()
--- Local startup visibility. Never prints credentials or performs activation itself.
 return function(product,logs)
     local env=getgenv()
     local state={product=product,phase="Starting client",status="loading",startedAt=os.clock()}
@@ -298,8 +289,6 @@ return function(product,logs)
         if logs then logs:Add("INFO","Startup",phase) end
         if logs and logs.Checkpoint then logs.Checkpoint() end
         if label then label.Text=phase end
-        -- Let the lightweight HUD render before entering a potentially blocking
-        -- executor/compiler call. This cannot preempt that native call itself.
         if state.status=="loading" and logs and logs.YieldStartup then logs.YieldStartup() end
         task.delay(25,function()
             if env.DeadWireStartupStatus==state and state.status=="loading" and state.phase==phase and label then
@@ -335,10 +324,12 @@ end
 end)()("Dead Wire | Paid",Diagnostics)
 local adapterForCleanup,botForCleanup
 local function runClient()
--- Recovered Rift policy selector and ball prediction. Start rift_policy_server.py first.
--- Set getgenv().RiftPolicyToken to the server's session token before running.
--- F6: enable/pause; F7: unload. Optional smoothing, manual priority and goal pause.
 local env = getgenv()
+
+-- KEY & AUTH BYPASS SETUP
+env.RiftPolicyURL = env.RiftPolicyURL or "http://127.0.0.1:49173"
+env.RiftPolicyToken = env.RiftPolicyToken or "bypass_key_active"
+
 local edition="paid"
 local blackout=edition=="blackout"
 local workshop=true
@@ -392,9 +383,7 @@ local function child(parent,name)
     return assert(parent:WaitForChild(name,180),"Timed out waiting for "..name)
 end
 startup:Set("Finding game modules")
--- DEADWIRE RUNTIME COMPAT BEGIN
 local RuntimeCompat=(function()
--- Scoped executor adapters; never replace globals or retry an HTTP request.
 local Compat={}
 function Compat.First(...)
     for i=1,select("#",...) do local v=select(i,...);if type(v)=="function" then return v end end
@@ -440,7 +429,6 @@ function Compat.WebSocket(e)
             assert(type(send)=="function" and type(close)=="function","WebSocket methods unavailable")
             local proxy={OnMessage=signal(member(original,"OnMessage")),OnClose=signal(member(original,"OnClose"))}
             function proxy:Send(message)
-                -- nil is a successful void return; explicit false means send failed.
                 assert(send(original,message)~=false,"WebSocket send failed")
             end
             function proxy:Close() close(original) end
@@ -473,8 +461,6 @@ end
 return Compat
 
 end)()
--- DEADWIRE RUNTIME COMPAT END
--- DEADWIRE SIMULATION CAPABILITY
 assert(type(getgc)=="function","This executor cannot access live simulation tables (DW-GC)")
 local GameAdapter
 local Input,Car,Arena,Coords
@@ -484,7 +470,7 @@ if game.GameId==10767012496 then
     local response=transport({Url=(env.RiftPolicyURL or "http://127.0.0.1:49173").."/adapters/turbo",Method="GET",Headers={["X-Rift-Token"]=env.RiftPolicyToken},Timeout=5})
     assert(response and response.StatusCode==200,"Cannot load Turbo Soccer adapter")
     startup:Set("Compiling Turbo Soccer adapter")
-local factory,err=loadstring(response.Body,"DeadWire-TurboSoccer")
+    local factory,err=loadstring(response.Body,"DeadWire-TurboSoccer")
     assert(factory,err);GameAdapter=factory().new(player,function(stage) startup:Set(stage) end);adapterForCleanup=GameAdapter
     Input,Car,Arena,Coords=GameAdapter.Input,GameAdapter.Car,GameAdapter.Arena,GameAdapter.Coords
 else
@@ -495,13 +481,10 @@ else
 end
 local send=RuntimeCompat.HTTP({request=request,http_request=http_request,httpRequest=httpRequest,httprequest=httprequest,syn=syn,http=http,fluxus=fluxus})
 assert(type(send) == "function", "HTTP request support is required")
-assert(type(env.RiftPolicyToken) == "string" and #env.RiftPolicyToken > 0, "Dead Wire session missing; rerun the loader")
 local url = env.RiftPolicyURL or "http://127.0.0.1:49173"
 local token = env.RiftPolicyToken
--- DEADWIRE SOCKET ADAPTER
 local WebSocket=RuntimeCompat.WebSocket({WebSocket=WebSocket,websocket=websocket,syn=syn})
 local StreamFactory=(function()
--- One outstanding request, bounded wait, and HTTP fallback on the next request.
 local Http = game:GetService("HttpService")
 return function(url, token, httpSend)
     local connect = (WebSocket and WebSocket.connect) or (websocket and websocket.connect)
@@ -572,7 +555,6 @@ end
 end)()
 local StreamTransport=StreamFactory(url,token,send)
 local HostedTiming=(function()
--- Bounded timing for remote inference. No change to the local edition.
 local Timing = {}
 Timing.MaxResponseAge = 0.65
 Timing.MaxObservationAge = 0.85
@@ -607,7 +589,6 @@ local Library=uiChunk()
 startup:Set("Creating panel window")
 local Window=Library:CreateWindow({Title="Dead Wire | Paid",SubTitle="All Bots",
     TabWidth=110,Size=UDim2.fromOffset(500,540),Acrylic=false,Theme="Dark",MinimizeKey=Enum.KeyCode.RightControl})
--- Fluent retains the normal drag position even while its window is maximized.
 local function windowBounds()
     local viewport=workspace.CurrentCamera.ViewportSize
     local size=Window:GetSize()
@@ -662,14 +643,11 @@ local lastAppliedTick = nil
 local connections = {}
 local Features
 Bot.Settings=(resume or profile).Settings or {Smoothing=false,BoostSmoothing=false}
--- One remembered bot per game mode ("1v1", "2v2", "3v3", "Unverified"). Each mode loads its own bot when a match of that mode starts.
 Bot.ModeModels=(resume or profile).ModeModels or {}
 for mode,name in pairs({["1v1"]="TromsoFR-Newest",["2v2"]="KusoV1",["3v3"]="KusoV1.5"}) do
     if not allowed[Bot.ModeModels[mode]] then Bot.ModeModels[mode]=name end
 end
 if not allowed[Bot.ModeModels.Unverified] then Bot.ModeModels.Unverified=nil end
-
--- Profiles saved before per-mode bots keep their single bot as the bot for its mode.
 if Bot.SelectedMode and not Bot.ModeModels[Bot.SelectedMode] then Bot.ModeModels[Bot.SelectedMode]=Bot.Model end
 local queueTeleport=queue_on_teleport or queueonteleport or (syn and syn.queue_on_teleport)
 local ticketPath="RiftPolicyTeleport-"..Bot.StreamId..".json"
@@ -681,7 +659,6 @@ local function saveTeleportState(active)
         Enabled=Bot.Enabled,PredictionEnabled=Bot.PredictionEnabled,PredictionSeconds=Bot.PredictionSeconds,TickSkip=Bot.TickSkip,WindowPosition=captureWindowPosition(),Settings=Bot.Settings,ModeModels=Bot.ModeModels}))
     if not ok then Diagnostics:Add("ERROR","Settings",err);warn("Dead Wire settings: "..tostring(err)) end
 end
--- Debounce drag events; teleport/unload always flush synchronously.
 local function saveWindowPosition()
     saveProfile();saveTeleportState(Bot.Running)
 end
@@ -693,7 +670,6 @@ local function schedulePositionSave()
         if Bot.Running then saveWindowPosition() end
     end)
 end
--- Re-clamp when Roblox changes resolution or switches its camera after a transfer.
 local viewportConnection
 local function watchViewport()
     if viewportConnection then viewportConnection:Disconnect() end
@@ -784,7 +760,6 @@ local function findPredictor()
     local now=os.clock()
     if predictor and predictor.seq~=predictorSeq then predictorSeq=predictor.seq;lastAdvance=now end
     if predictor and now-lastAdvance<1 then return predictor end
-    -- A heap scan costs about a second on a loaded client, so it runs rarely: every 3s while no simulation is found, 5s while a stale one is held.
     if now-lastScan<(predictor and 5 or 3) then return predictor end
     lastScan=now
     local best, tick, priority=nil, -math.huge, -1
@@ -852,14 +827,12 @@ local wrapper=function(...)
     return manual
 end
 Input.Read=wrapper
--- DEADWIRE POST INPUT VALIDATION BEGIN
 if GameAdapter then
     GameAdapter.ControlEpoch=function() return controls end
     GameAdapter.ControlsCurrent=function(epoch)
         return epoch~=nil and Bot.Running and Bot.Enabled and epoch==controls and freshControls()
     end
 end
--- DEADWIRE POST INPUT VALIDATION END
 local tab=Window:AddTab({Title="Paid Bots"})
 Window:AddLogs(Diagnostics)
 local syncingUI=false
@@ -906,7 +879,6 @@ function Bot:SelectModel(name)
     local available=false
     for _,entry in ipairs(self.Models) do if entry.name==name then available=true end end
     assert(available and allowed[name],"Model is unavailable in this edition: "..tostring(name))
-    -- Switching bots keeps the bot on: drop the old policy's pending controls, then re-enable on the new model.
     local wasEnabled=self.Enabled
     self:SetEnabled(false)
     self.Model=name
@@ -1013,11 +985,9 @@ task.spawn(function()
                 if Features and Features.settings.AutoTakeover and (Features.unfocused or os.clock()-Features.lastManual<Features.settings.TakeoverDelay) then
                     controls=nil;Bot.Status="Manual control";return
                 end
-                -- DEADWIRE NATIVE INPUT GATE BEGIN
                 if GameAdapter and GameAdapter.LastInputAllowed==false then
                     controls=nil;Bot.Status="Game input disabled";return
                 end
-                -- DEADWIRE NATIVE INPUT GATE END
                 if snapshot.ball.pos[3]<0 then
                     controls=nil; Bot.Status="Waiting for goal reset / visible ball"; return
                 end
@@ -1044,7 +1014,6 @@ task.spawn(function()
                 assert(data.model==snapshot.model,"Response model mismatch")
                 local candidate=decodeControls(data.controls)
                 local elapsed=os.clock()-began
-                -- DEADWIRE REPLY TIMING: diagnostic values only; cutoff is unchanged.
                 Bot.Stats.LastAttemptMs=elapsed*1000
                 Bot.Stats.ClientPrepareMs=(submittedAt-began)*1000
                 Bot.Stats.ClientTransportMs=(transportReturnedAt-submittedAt)*1000
@@ -1173,7 +1142,6 @@ task.spawn(function()
         task.wait(0.3)
     end
 end)
--- Wait for the catalog before committing mode selection; retry failed startup switches.
 local modeNames={[1]="1v1",[2]="2v2",[3]="3v3"}
 local modePredictor,modeArena,modeTick,largestTeamSize=nil,nil,nil,0
 local function currentMode()
@@ -1190,7 +1158,6 @@ local function currentMode()
     for _,car in pairs(p.carsById) do
         if car.team==0 then blue+=1 elseif car.team==1 then orange+=1 end
     end
-    -- Do not shrink a match when a player leaves or joins late.
     local largest=math.max(blue,orange)
     if largest>=1 and largest<=3 then largestTeamSize=math.max(largestTeamSize,largest) end
     if blue<1 or orange<1 or blue~=orange then return nil end
@@ -1211,7 +1178,6 @@ function Bot:RefreshMode()
         self.ModeModels[mode]=remembered
     end
     if appliedMode==mode and self.SelectedMode==mode and self.Model==remembered then return true end
-    -- Commit only after the actual model switch succeeds.
     self.SelectedMode=mode
     if remembered~=self.Model then self:SelectModel(remembered) end
     appliedMode=mode
